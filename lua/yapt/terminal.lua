@@ -1368,11 +1368,17 @@ end
 -- create does not open a third pane beside the current buffer. The donor
 -- session stays running; only its window handle is cleared (hide() would
 -- close the slot). Extra visible splits in this tab are hidden.
+-- A window counts only while it still shows that terminal's buffer. After
+-- :b the handle can point at a file; stealing it would replace the file.
 local function adopt_visible_split(term)
   sync_fullscreen_state()
   local visible = {}
   for id, _ in pairs(terminals) do
-    if id ~= term.id and is_visible(id) then
+    local tracked = terminals[id]
+    local shows_terminal = is_visible(id)
+      and tracked.buf ~= nil
+      and vim.api.nvim_win_get_buf(tracked.win) == tracked.buf
+    if id ~= term.id and shows_terminal then
       local is_fullscreen = fullscreen_state.active and fullscreen_state.terminal_id == id
       if not is_fullscreen then
         table.insert(visible, id)
