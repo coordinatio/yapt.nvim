@@ -119,12 +119,15 @@ When inside a terminal, manage sessions without leaving:
 | Keybinding | Action |
 |------------|--------|
 | ``<A-\`>`` | Exit terminal mode / hide terminal window |
+| `<A-w>` | Move focus to another window |
 | `<A-=>` | Toggle fullscreen mode / exit terminal |
 | `<F7>` | Create new terminal |
 | `<F6>` | Select terminal from fuzzy picker |
 | `<F2>` | Rename current terminal |
 | `<F12>` | Open or switch to last prompt file from history |
 | `<leader>i` | Send next key directly to TUI app in terminal |
+
+`<A-w>` moves focus to the previous window in this tab, or else the next non-floating window, skipping windows with `focusable == false`, and leaves the terminal visible. It does nothing when this is the only usable window. Job mode, or normal mode on the last line, keeps autoscroll; normal mode above the last line keeps the scrollback snapshot.
 
 ### Passthrough
 
@@ -297,6 +300,7 @@ require("yapt").setup({
 
   terminal_keybindings = {
     hide             = "<A-`>",
+    unfocus          = "<A-w>",
     toggle_fullscreen = "<A-=>",
     new              = "<F7>",
     rename           = "<F2>",

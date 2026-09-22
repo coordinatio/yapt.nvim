@@ -168,15 +168,21 @@ local function hide_current_terminal(mode)
   if not id then
     return
   end
-  if terminal.is_fullscreen_in_current_tab(id) then
-    terminal.hide_fullscreen(mode)
-    return
-  end
+  -- hide() sends a fullscreen terminal through hide_fullscreen, and drops a
+  -- follow-active hide-map "n" so the stored mode stays.
   terminal.hide(id, mode)
 end
 
 function M.hide_from_terminal_handler(mode)
   hide_current_terminal(mode)
+end
+
+-- Leave the terminal window without hiding it. Terminal-job mode, or normal
+-- mode with the cursor already on the last line, parks the cursor there so
+-- the window keeps tailing output. Normal mode above the last line snapshots
+-- scrollback.
+function M.unfocus_terminal_handler()
+  terminal.unfocus()
 end
 
 -- Leave terminal-job mode for UI that needs normal mode (pickers, vim.ui.input).

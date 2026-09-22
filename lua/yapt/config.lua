@@ -67,6 +67,7 @@ M.defaults = {
   -- Terminal mode keybindings (when inside terminal buffer)
   terminal_keybindings = {
     hide = "<A-`>",      -- Hide terminal window (terminal + normal mode in terminal)
+    unfocus = "<A-w>",   -- Move focus to another window
     toggle_fullscreen = "<A-=>", -- Toggle fullscreen mode
     new = "<F7>",        -- Create new terminal
     rename = "<F2>",     -- Rename current terminal

@@ -180,8 +180,137 @@ local function ensure_ui_state(term)
   return term.ui_state
 end
 
+-- Neovim tails a terminal window, focused or not, only while its cursor is on
+-- the last buffer line. <C-\><C-n> parks the cursor on the TUI row instead.
+local function cursor_on_last_line(win, buf)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+  local ok, pos = pcall(vim.api.nvim_win_get_cursor, win)
+  if not ok or not pos then
+    return false
+  end
+  return pos[1] == vim.api.nvim_buf_line_count(buf)
+end
+
+local function pin_cursor_to_end(win, buf)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local last = vim.api.nvim_buf_line_count(buf)
+  if last < 1 then
+    return
+  end
+  -- Already on the last line: keep the column. Job mode still moves here
+  -- when the cursor is sitting on the TUI row above the end.
+  if cursor_on_last_line(win, buf) then
+    return
+  end
+  -- Clamped to the last byte, so the end of a long line stays in view.
+  pcall(vim.api.nvim_win_set_cursor, win, { last, vim.v.maxcol })
+end
+
 -- Suppress TermLeave mode overwrites while hide() is tearing down the window.
 local hiding_terminal = false
+
+-- True while unfocus() is leaving terminal-job mode and pinning the cursor.
+-- stopinsert moves the cursor onto the TUI row before we pin it to the end;
+-- that intermediate CursorMoved must not end follow.
+local unfocusing = false
+
+-- Extra-split unfocus only. stopinsert then switches to another window of
+-- this same buffer, so ModeChanged and TermLeave both run here and would
+-- otherwise record the tracked window as a normal-mode leave. Cleared on
+-- the next tick: the other event in this turn still has to see it.
+-- Tracked-window unfocus does not set this.
+local function mark_unfocus_leave_skip(term)
+  term._skip_unfocus_leave = {}
+end
+
+local function take_unfocus_leave_skip(term)
+  local mark = term and term._skip_unfocus_leave
+  if not mark then
+    return false
+  end
+  vim.schedule(function()
+    if term._skip_unfocus_leave == mark then
+      term._skip_unfocus_leave = nil
+    end
+  end)
+  return true
+end
+
+-- Same-buffer destination of a job-mode unfocus. terminal_check_cursor()
+-- parks that window on the TUI row before TermLeave; TermLeave puts the view
+-- back. A normal-mode unfocus does not set this, because it never runs
+-- TermLeave and a leftover stash would hide scrolls on term.win forever.
+local function unfocus_dest_restore_pending(term, win)
+  local pending = term and term._unfocus_dest_restore
+  return pending ~= nil and win ~= nil and pending.win == win
+end
+
+local function restore_unfocus_dest(term)
+  local pending = term and term._unfocus_dest_restore
+  if not pending then
+    return
+  end
+  local win = pending.win
+  local view = pending.view
+  if view and win and vim.api.nvim_win_is_valid(win)
+    and term.buf and vim.api.nvim_buf_is_valid(term.buf)
+    and vim.api.nvim_win_get_buf(win) == term.buf then
+    -- Keep the stash set across winrestview so a scroll autocmd fired from
+    -- the restore still sees the TUI-row jump as not a user scroll.
+    pcall(vim.api.nvim_win_call, win, function()
+      pcall(vim.fn.winrestview, view)
+    end)
+  end
+  if term._unfocus_dest_restore == pending then
+    term._unfocus_dest_restore = nil
+  end
+end
+
+-- Buffer that entered terminal-job mode (TermEnter, or ModeChanged into "t").
+-- A terminal <Cmd> map that stopinserts and then switches windows stays in
+-- "t" until the map returns. TermLeave and ModeChanged (t → nt) then both run
+-- on the destination buffer, in that same turn, before vim.schedule.
+-- ui state for the leave is written only when this callback's buffer is the
+-- one recorded here. Do not clear the record from a non-owner, and do not
+-- clear it synchronously: the other event still has to see it.
+local terminal_job_buf = nil
+local terminal_job_gen = 0
+
+local function remember_terminal_job(buf)
+  terminal_job_gen = terminal_job_gen + 1
+  terminal_job_buf = buf
+end
+
+local function terminal_job_owned_by(buf)
+  return buf ~= nil and terminal_job_buf == buf
+end
+
+-- Deferred so the other leave event in this turn still sees the owner.
+-- A newer TermEnter bumps the generation and must not be cleared.
+local function clear_terminal_job_buf(buf)
+  local gen = terminal_job_gen
+  vim.schedule(function()
+    if terminal_job_buf == buf and terminal_job_gen == gen then
+      terminal_job_buf = nil
+    end
+  end)
+end
+
+local function in_terminal_win(win)
+  return win
+    and vim.api.nvim_win_is_valid(win)
+    and vim.api.nvim_get_current_win() == win
+end
 
 local function with_hiding_terminal(fn)
   hiding_terminal = true
@@ -220,6 +349,18 @@ local function save_ui_state(id, mode_override)
   if not term then return end
   local ui = ensure_ui_state(term)
 
+  -- Follow owns the live cursor. Skip winsaveview so a hide does not freeze
+  -- the tail. An explicit "t" or "n" still applies: fullscreen toggle and
+  -- switch_to save that mode before hide. hide() itself passes nil instead
+  -- of the normal-mode hide map's "n", so dismiss does not replace a stored
+  -- "t".
+  if term._keep_follow then
+    if mode_override == "t" or mode_override == "n" then
+      ui.mode = mode_override
+    end
+    return
+  end
+
   if mode_override == "t" or mode_override == "n" then
     ui.mode = mode_override
   elseif is_win_displayed(term.win) and vim.api.nvim_get_current_win() == term.win then
@@ -253,12 +394,13 @@ local function restore_normal_view(term, view, gen)
     return nil
   end
   local clamped
+  -- Late BufEnter startinsert may have put us back in job mode; leave it
+  -- before restoring or the terminal job cursor wins. Mode "t" is global:
+  -- only this window's job may be stopped.
+  if vim.api.nvim_get_mode().mode == "t" and in_terminal_win(term.win) then
+    vim.cmd("stopinsert")
+  end
   vim.api.nvim_win_call(term.win, function()
-    -- Late BufEnter startinsert may have put us back in job mode; leave it
-    -- before restoring or the terminal job cursor wins.
-    if vim.api.nvim_get_mode().mode == "t" then
-      vim.cmd("stopinsert")
-    end
     clamped = clamp_view(view, 0)
     pcall(vim.fn.winrestview, clamped)
   end)
@@ -279,6 +421,12 @@ local function begin_ui_apply(term)
   return term._ui_apply_gen
 end
 
+-- Bumped when a follow-pin retry loop must not stopinsert. Deferred
+-- callbacks captured the previous value and return before touching mode.
+local function invalidate_follow_pin_retry(term)
+  term._follow_pin_token = (term._follow_pin_token or 0) + 1
+end
+
 local function finish_ui_apply(term, gen)
   if term._ui_apply_gen ~= gen then
     return
@@ -286,8 +434,16 @@ local function finish_ui_apply(term, gen)
   if term._view_restore_gen == gen then
     term._view_restore_gen = nil
   end
+  if term._follow_pin_gen == gen then
+    term._follow_pin_gen = nil
+  end
+  -- TermLeave clears this only when it runs on the owner. A window switch
+  -- delivers that event to the destination, which returns first. Drop the
+  -- flag here so a later scroll can still end follow.
+  term._follow_pinning = nil
   term._ui_apply_pending = false
   term._suppress_winenter_restore = false
+  invalidate_follow_pin_retry(term)
 end
 
 -- Remount can fire BufEnter/startinsert/TermEnter and clobber ui_state before
@@ -377,6 +533,170 @@ local function schedule_normal_view_restore(term, view, gen)
   end
 end
 
+-- Pin has stuck: cursor is on the last line and this window is not in
+-- terminal-job mode. A later TermEnter is the user.
+local function follow_pin_stuck(term)
+  if not term or not term._keep_follow or not is_win_displayed(term.win) then
+    return false
+  end
+  if vim.api.nvim_get_mode().mode == "t" and in_terminal_win(term.win) then
+    return false
+  end
+  return cursor_on_last_line(term.win, term.buf)
+end
+
+-- Drop the apply guards once the tail is pinned. Do not set _keep_follow.
+-- Invalidates the retry token so a later timer cannot stopinsert a real
+-- TermEnter. _keep_follow stays set; that TermEnter clears it.
+local function complete_follow_pin(term, gen)
+  if not follow_pin_stuck(term) then
+    return false
+  end
+  term._follow_pinning = nil
+  if term.ui_state then
+    term.ui_state.mode = "n"
+  end
+  invalidate_follow_pin_retry(term)
+  finish_ui_apply(term, gen)
+  return true
+end
+
+-- stopinsert from a timer only sets a flag until terminal_enter() unwinds.
+-- terminal_check_cursor() then parks the cursor on the TUI row, and only a
+-- synchronous pin in the owner buffer's TermLeave sticks. A scroll that
+-- cleared _keep_follow must not pin or set the flag again.
+local function reassert_follow_cursor(term, gen)
+  if term._ui_apply_gen ~= gen or not term._keep_follow or not is_win_displayed(term.win) then
+    return
+  end
+  if follow_pin_stuck(term) then
+    complete_follow_pin(term, gen)
+    return
+  end
+  -- Only this window's job. Another terminal's mode must not be stopped.
+  if vim.api.nvim_get_mode().mode == "t" and in_terminal_win(term.win) then
+    -- Set before stopinsert. CursorMoved sees the TUI-row jump before TermLeave.
+    term._follow_pinning = true
+    local stopped, stop_err = pcall(vim.cmd, "stopinsert")
+    if not stopped then
+      term._follow_pinning = nil
+      error(stop_err)
+    end
+    return
+  end
+  if not term._keep_follow then
+    return
+  end
+  -- Do not finish here. The caller retries only while the tail is not pinned
+  -- yet. Once this pin sticks, that caller must not arm another stopinsert loop.
+  pin_cursor_to_end(term.win, term.buf)
+end
+
+-- Re-pin a normal-mode follow across a deferred BufEnter startinsert.
+-- Retries cover a job-mode exit that has not pinned yet. Once the cursor is
+-- on the last line and this window is not in terminal-job mode, stop:
+-- finish the apply so a later TermEnter is the user and is not stopinsert'd.
+-- A scroll that cleared _keep_follow is left alone.
+-- Do not call this after the pin has already stuck. complete_follow_pin /
+-- finish_ui_apply bump _follow_pin_token; a stale callback returns before
+-- stopinsert.
+local function schedule_follow_pin(term, gen)
+  invalidate_follow_pin_retry(term)
+  local token = term._follow_pin_token
+  term._view_restore_gen = gen
+  term._follow_pin_gen = gen
+  local delays_ms = { 0, 20, 50, 120 }
+  local remaining = #delays_ms
+
+  local function apply_once()
+    if term._follow_pin_token ~= token then
+      return false
+    end
+    if term._ui_apply_gen ~= gen or not is_win_displayed(term.win) then
+      return false
+    end
+    local ok, err = pcall(function()
+      with_applying_ui_state(function()
+        if term._follow_pin_token ~= token then
+          return
+        end
+        if not term._keep_follow then
+          finish_ui_apply(term, gen)
+          return
+        end
+        if follow_pin_stuck(term) then
+          complete_follow_pin(term, gen)
+          return
+        end
+        reassert_follow_cursor(term, gen)
+        if term._follow_pin_token ~= token then
+          return
+        end
+        if follow_pin_stuck(term) then
+          complete_follow_pin(term, gen)
+          return
+        end
+        if term._keep_follow and term.ui_state then
+          term.ui_state.mode = "n"
+        end
+      end)
+    end)
+    if not ok then
+      error(err)
+    end
+    return true
+  end
+
+  for _, delay in ipairs(delays_ms) do
+    vim.defer_fn(function()
+      -- Token check is first: a pin that already stuck must not stopinsert.
+      if term._follow_pin_token ~= token then
+        return
+      end
+      remaining = remaining - 1
+      if term._ui_apply_gen == gen then
+        apply_once()
+      end
+      if term._follow_pin_token ~= token then
+        return
+      end
+      if remaining <= 0 then
+        if term._follow_pinning then
+          -- stopinsert only sets a flag until terminal_enter unwinds.
+          -- This callback is a K_EVENT, and state_handle_k_event drains
+          -- vim.schedule before that return, so a scheduled finish would
+          -- clear _follow_pin_gen before TermLeave can pin.
+          -- defer_fn(0) runs on a later loop tick, after TermLeave.
+          -- complete_follow_pin finishes a pin that stuck and bumps the
+          -- token. If this window is still in job mode, TermLeave has not
+          -- run: defer again instead of clearing _follow_pin_gen. If the
+          -- pin never sticks, finish this generation so _view_restore_gen
+          -- cannot stay set. A newer apply has a different gen.
+          -- While mode stays "t", defer a handful of times, then finish
+          -- this generation anyway so a later TermEnter is the user.
+          local deferrals_left = 8
+          local function finish_pinned_apply()
+            if term._follow_pin_token ~= token or term._ui_apply_gen ~= gen then
+              return
+            end
+            if deferrals_left > 0
+              and vim.api.nvim_get_mode().mode == "t"
+              and in_terminal_win(term.win) then
+              deferrals_left = deferrals_left - 1
+              vim.defer_fn(finish_pinned_apply, 0)
+              return
+            end
+            finish_ui_apply(term, gen)
+          end
+          vim.defer_fn(finish_pinned_apply, 0)
+        else
+          finish_ui_apply(term, gen)
+        end
+      end
+    end, delay)
+  end
+end
+
 -- Restore or force-insert after a terminal window is shown.
 -- opts.force_insert: always enter terminal-job mode (send/paste paths).
 -- opts.restore_view: when restoring normal mode, apply winsaveview (default true).
@@ -395,15 +715,25 @@ local function apply_ui_state(id, opts)
   local force_insert = opts.force_insert == true
   local restore_view = opts.restore_view ~= false
   local ui = term.ui_state
-  local restore_normal = not force_insert and ui and ui.mode == "n"
+  -- _keep_follow means the cursor stays on the last line, not "enter job mode".
+  -- Normal mode must not winrestview (stale lnum freezes the tail) or startinsert.
+  local keep_follow_normal = term._keep_follow and ui and ui.mode == "n" and not force_insert
+  local restore_normal = not force_insert and not keep_follow_normal and ui and ui.mode == "n"
   -- Snapshot before stopinsert: TermLeave may rewrite the live ui_state table.
   local view = ui and ui.view or nil
 
   local gen = begin_ui_apply(term)
   -- Block TermEnter from flipping ui.mode to "t" for the whole apply
   -- (common race: user autocmd BufEnter term://* startinsert during show).
-  if restore_normal then
+  -- keep_follow_normal uses the same gen so that startinsert is stopinsert'd
+  -- and the cursor is re-pinned, without winrestview of a stale snapshot.
+  if restore_normal or keep_follow_normal then
     term._view_restore_gen = gen
+  end
+  -- ModeChanged uses this to avoid scheduling another stopinsert for the
+  -- same gen. reassert_follow_cursor owns the follow-pin stopinsert.
+  if keep_follow_normal then
+    term._follow_pin_gen = gen
   end
 
   with_applying_ui_state(function()
@@ -419,9 +749,32 @@ local function apply_ui_state(id, opts)
     local ok, err = pcall(function()
       with_applying_ui_state(function()
         vim.api.nvim_set_current_win(term.win)
+        if keep_follow_normal then
+          -- The window was hidden, so output could not tail. Pin once it is
+          -- shown again. A BufEnter startinsert is left by stopinsert; the
+          -- owner TermLeave pins, because a scheduled pin loses to
+          -- terminal_check_cursor. Do not startinsert and do not winrestview.
+          -- Once the cursor is on the last line outside job mode, the pin has
+          -- stuck: finish this apply so a later TermEnter is not stopinsert'd.
+          -- A scroll that cleared follow stays cleared.
+          if term._keep_follow then
+            reassert_follow_cursor(term, gen)
+            if term._keep_follow and term.ui_state then
+              term.ui_state.mode = "n"
+            end
+            -- Only while the tail is not pinned yet. A stuck pin finishes
+            -- below (pending_view_restore stays false) so a later TermEnter
+            -- stays in job mode. Scheduling again would re-arm stopinsert.
+            if term._keep_follow and not follow_pin_stuck(term) then
+              schedule_follow_pin(term, gen)
+              pending_view_restore = true
+            end
+          end
+          return
+        end
         if restore_normal then
           -- Only leave job mode when needed (avoids a spurious TermLeave rewrite).
-          local left_job = vim.api.nvim_get_mode().mode == "t"
+          local left_job = vim.api.nvim_get_mode().mode == "t" and in_terminal_win(term.win)
           if restore_view and view then
             if left_job then
               vim.cmd("stopinsert")
@@ -441,12 +794,15 @@ local function apply_ui_state(id, opts)
         end
         -- Jump to the end first — startinsert does nothing useful in scrollback.
         -- Skip when refocusing an already-visible window (restore_view == false).
+        -- Clear follow here: this startinsert runs inside applying_ui_state, so
+        -- TermEnter/ModeChanged will not clear the flag themselves.
         if restore_view then
           vim.api.nvim_win_call(term.win, function()
             local last = vim.api.nvim_buf_line_count(0)
             pcall(vim.api.nvim_win_set_cursor, 0, { last, 0 })
           end)
         end
+        term._keep_follow = nil
         vim.cmd("startinsert")
       end)
     end)
@@ -476,6 +832,157 @@ end
 -- Resolve a YAPT terminal id from a buffer (default: current buffer).
 function M.id_for_buf(buf)
   return id_for_buf(buf)
+end
+
+-- Floats and non-focusable windows (which-key, notify, hover) are not
+-- unfocus targets. nvim_set_current_win will enter focusable=false.
+local function unfocus_window_usable(win)
+  if not win or not vim.api.nvim_win_is_valid(win) or util.is_float_window(win) then
+    return false
+  end
+  local cfg = vim.api.nvim_win_get_config(win)
+  return cfg.focusable ~= false
+end
+
+-- Previous window in this tab, else the next usable window (wrapping).
+-- Other terminals and quickfix count. No-op when this is the only window.
+local function unfocus_destination(win)
+  local altnr = vim.fn.winnr("#")
+  if altnr > 0 then
+    local alt = vim.fn.win_getid(altnr)
+    if alt ~= 0 and alt ~= win and util.win_in_current_tab(alt) and unfocus_window_usable(alt) then
+      return alt
+    end
+  end
+  local wins = vim.api.nvim_tabpage_list_wins(0)
+  local start
+  for i, w in ipairs(wins) do
+    if w == win then
+      start = i
+      break
+    end
+  end
+  if not start then
+    return nil
+  end
+  for offset = 1, #wins - 1 do
+    local w = wins[(start + offset - 1) % #wins + 1]
+    if unfocus_window_usable(w) then
+      return w
+    end
+  end
+  return nil
+end
+
+-- Move focus to another window in this tab without hiding the terminal.
+-- From terminal-job mode, or normal mode with the cursor already on the last
+-- line, park the cursor on the last line so the window keeps tailing output.
+-- Remembered mode is "t" when this started in terminal-job mode, or when
+-- re-parking a follow that already stored "t". A new follow from normal mode
+-- stays "n". A cursor above the last line clears follow and stores "n".
+-- An extra split whose window is not term.win only moves focus (and may pin
+-- that split). It does not read or write the tracked window's follow, mode,
+-- or view. No-op when this is the only window.
+--
+-- stopinsert from a terminal <Cmd> map only sets a flag. terminal_enter keeps
+-- running and, on exit, terminal_check_cursor() puts the current window's
+-- cursor back on the TUI row unless the window was already switched. Pin and
+-- nvim_set_current_win stay in this call, before the mapping returns.
+function M.unfocus(id)
+  id = id or id_for_buf()
+  local term = get_terminal(id)
+  if not term or not term.buf or not vim.api.nvim_buf_is_valid(term.buf) then
+    return
+  end
+  local win = vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= term.buf then
+    return
+  end
+  local dest = unfocus_destination(win)
+  if not dest or dest == win or not vim.api.nvim_win_is_valid(dest) then
+    return
+  end
+
+  unfocusing = true
+  local ok, err = pcall(function()
+    -- Before stopinsert. Mode stays "t" until this mapping returns, so a
+    -- later nvim_get_mode() cannot tell job mode from the exit transition.
+    local job_mode = vim.api.nvim_get_mode().mode == "t"
+    -- A still-valid term.win that is not this window is an extra split.
+    -- Pin that split locally if it should keep tailing. Do not retarget
+    -- term.win and do not read or write follow, mode, or view.
+    local tracked = not term.win or not vim.api.nvim_win_is_valid(term.win) or term.win == win
+    if not tracked then
+      if job_mode then
+        -- Same-buffer dest receives this leave. A different buffer does not
+        -- write this terminal, and would never clear the skip.
+        if vim.api.nvim_win_get_buf(dest) == term.buf then
+          mark_unfocus_leave_skip(term)
+        end
+        vim.cmd("stopinsert")
+      end
+      if job_mode or cursor_on_last_line(win, term.buf) then
+        pin_cursor_to_end(win, term.buf)
+      end
+    elseif job_mode or cursor_on_last_line(win, term.buf) then
+      term.win = win
+      -- Before stopinsert: ModeChanged/TermLeave must not record mode "n".
+      -- The flag means "cursor stays on the last line", not "enter job mode".
+      term._keep_follow = true
+      if job_mode then
+        vim.cmd("stopinsert")
+      end
+      pin_cursor_to_end(win, term.buf)
+      local ui = ensure_ui_state(term)
+      if cursor_on_last_line(win, term.buf) then
+        -- job_mode was sampled before stopinsert. Re-parking keeps an
+        -- existing "t"; a follow that starts from normal mode stays "n".
+        if job_mode or ui.mode == "t" then
+          ui.mode = "t"
+        else
+          ui.mode = "n"
+        end
+      else
+        term._keep_follow = nil
+        ui.mode = "n"
+        local view = capture_view(win)
+        if view then
+          ui.view = view
+        end
+      end
+    else
+      -- Cursor is already above the last line. WinLeave skips while
+      -- _keep_follow is set, so snapshot this window before switching.
+      term.win = win
+      term._keep_follow = nil
+      local ui = ensure_ui_state(term)
+      ui.mode = "n"
+      local view = capture_view(win)
+      if view then
+        ui.view = view
+      end
+    end
+    -- Same buffer and leaving job mode: terminal_check_cursor() yanks dest
+    -- onto the TUI row before TermLeave. Stash the view for that autocmd.
+    -- A normal-mode unfocus does not run TermLeave, so it must not stash.
+    -- A vim.schedule restore runs after normal_check and looks like a scroll.
+    if job_mode and vim.api.nvim_win_get_buf(dest) == term.buf then
+      local dest_view = capture_view(dest)
+      if dest_view then
+        term._unfocus_dest_restore = { win = dest, view = dest_view }
+      end
+    end
+    vim.api.nvim_set_current_win(dest)
+    -- Leave events for this stopinsert run on dest, which must not clear the
+    -- owner. They run when the mapping returns, before this scheduled clear.
+    if job_mode then
+      clear_terminal_job_buf(term.buf)
+    end
+  end)
+  unfocusing = false
+  if not ok then
+    error(err)
+  end
 end
 
 function M.is_running(id)
@@ -596,12 +1103,19 @@ end
 local function hide(id, mode_override)
   id = id or active_id or default_id
   sync_fullscreen_state()
+  local term = get_terminal(id)
+  -- The normal-mode hide map passes "n". While follow is active that would
+  -- replace a stored "t". Drop it here, including when this id is fullscreen
+  -- and we delegate to hide_fullscreen. A direct save_ui_state(id, "n") is
+  -- not this path.
+  if term and term._keep_follow and mode_override == "n" then
+    mode_override = nil
+  end
   if fullscreen_state.active and fullscreen_state.terminal_id == id then
     hide_fullscreen(mode_override)
     return
   end
 
-  local term = get_terminal(id)
   if not term or not term.win or not vim.api.nvim_win_is_valid(term.win) then
     return
   end
@@ -963,6 +1477,17 @@ local function create_terminal_instance(id, config, command, display_mode)
     })
   end
 
+  if term_keys.unfocus and term_keys.unfocus ~= "" then
+    local unfocus_rhs = '<Cmd>lua require("yapt").unfocus_terminal_handler()<CR>'
+    local unfocus_opts = {
+      noremap = true,
+      silent = true,
+      desc = "Move focus to another window"
+    }
+    vim.api.nvim_buf_set_keymap(term.buf, 't', term_keys.unfocus, unfocus_rhs, unfocus_opts)
+    vim.api.nvim_buf_set_keymap(term.buf, 'n', term_keys.unfocus, unfocus_rhs, unfocus_opts)
+  end
+
   local term_cfg = config.terminal or {}
   if term_cfg.trim_yank_trailing_whitespace ~= false then
     vim.api.nvim_create_autocmd("TextYankPost", {
@@ -974,18 +1499,22 @@ local function create_terminal_instance(id, config, command, display_mode)
   vim.api.nvim_create_autocmd("TermEnter", {
     buffer = term.buf,
     callback = function()
+      -- This buffer entered job mode even when the ui update below is skipped.
+      remember_terminal_job(term.buf)
+      local t = terminals[id]
       if hiding_terminal or applying_ui_state then
         return
       end
-      local t = terminals[id]
       if not t or suppress_winenter_restore(t) then
         return
       end
-      -- Do not clobber a pending normal-mode restore (show→apply race with
-      -- user BufEnter startinsert autocmds).
+      -- Do not clobber a pending normal-mode or follow restore (show→apply
+      -- race with user BufEnter startinsert autocmds). The startinsert
+      -- branch clears _keep_follow itself while these guards are set.
       if t._view_restore_gen then
         return
       end
+      t._keep_follow = nil
       ensure_ui_state(t).mode = "t"
     end,
   })
@@ -996,18 +1525,42 @@ local function create_terminal_instance(id, config, command, display_mode)
     buffer = term.buf,
     callback = function()
       local t = terminals[id]
-      if not t or hiding_terminal then
+      if not t then
+        return
+      end
+      -- Extra-split unfocus of this buffer. Not a leave of the tracked window.
+      if take_unfocus_leave_skip(t) then
         return
       end
       local mode = vim.api.nvim_get_mode().mode
+      -- new_mode, not mode(): a t→nt leave must not record this buffer as the job.
+      if vim.v.event.new_mode == "t" then
+        remember_terminal_job(t.buf)
+      end
+      -- t→nt after a window switch is delivered here, not to the job buffer.
+      -- Leave that terminal's ui state alone. Do not clear terminal_job_buf:
+      -- TermLeave in this same turn still has to ignore the destination.
+      local owned_leave = vim.v.event.old_mode == "t" and terminal_job_owned_by(t.buf)
+      if vim.v.event.old_mode == "t" and not owned_leave then
+        return
+      end
+      if hiding_terminal then
+        return
+      end
       if t._view_restore_gen then
-        if mode == "t" then
+        -- Follow-pin stopinsert is only in reassert_follow_cursor. View restore
+        -- still leaves job mode, and only when this window is current.
+        if mode == "t" and t._follow_pin_gen ~= t._view_restore_gen then
+          local win = t.win
           vim.schedule(function()
             local cur = terminals[id]
             if not cur or not cur._view_restore_gen then
               return
             end
-            if vim.api.nvim_get_mode().mode == "t" then
+            if cur._follow_pin_gen == cur._view_restore_gen then
+              return
+            end
+            if in_terminal_win(win) and vim.api.nvim_get_mode().mode == "t" then
               vim.cmd("stopinsert")
             end
           end)
@@ -1015,6 +1568,16 @@ local function create_terminal_instance(id, config, command, display_mode)
         return
       end
       if applying_ui_state or suppress_winenter_restore(t) then
+        return
+      end
+      -- Real job entry ends follow. "nt" is normal mode for as long as this
+      -- terminal buffer is current (:help mode()) and must keep the flag.
+      if mode == "t" then
+        t._keep_follow = nil
+      end
+      if t._keep_follow and mode ~= "t" then
+        -- Unfocus parks the cursor on the last line. Recording mode "n" here
+        -- would restore that pre-leave view and freeze autoscroll.
         return
       end
       if mode == "t" then
@@ -1025,6 +1588,9 @@ local function create_terminal_instance(id, config, command, display_mode)
         if view then
           t.ui_state.view = view
         end
+        if owned_leave then
+          clear_terminal_job_buf(t.buf)
+        end
       end
     end,
   })
@@ -1032,24 +1598,65 @@ local function create_terminal_instance(id, config, command, display_mode)
   vim.api.nvim_create_autocmd("TermLeave", {
     buffer = term.buf,
     callback = function()
+      local buf = term.buf
+      -- After terminal_check_cursor(), before normal_check. Also when the
+      -- extra-split skip below would return first. Clears the stash.
+      restore_unfocus_dest(terminals[id])
+      -- Extra-split unfocus of this buffer. Not a leave of the tracked window.
+      -- Before the owner check, so this callback still clears the skip.
+      if take_unfocus_leave_skip(terminals[id]) then
+        return
+      end
+      -- Same misdirected t→nt as ModeChanged. Ignore without clearing the
+      -- job buffer so the other event still recognizes the real owner.
+      if not terminal_job_owned_by(buf) then
+        return
+      end
+      -- terminal_check_cursor() already moved this window onto the TUI row.
+      -- Pin here, synchronously. A vim.schedule pin does not stick. A
+      -- misdirected TermLeave is not the owner and returned above, so unfocus
+      -- cannot pin the destination. A scroll that cleared follow is not pinned
+      -- and the flag is not set again.
+      local t_pin = terminals[id]
+      if t_pin and t_pin._follow_pinning and not hiding_terminal then
+        -- Only this pin's generation. A cleared _follow_pin_gen must not
+        -- finish whatever apply is current.
+        local pin_gen = t_pin._follow_pin_gen
+        if pin_gen and pin_gen == t_pin._ui_apply_gen then
+          if t_pin._keep_follow and is_win_displayed(t_pin.win) then
+            pin_cursor_to_end(t_pin.win, t_pin.buf)
+          end
+          t_pin._follow_pinning = nil
+          complete_follow_pin(t_pin, pin_gen)
+        else
+          t_pin._follow_pinning = nil
+        end
+      elseif t_pin and t_pin._follow_pinning and hiding_terminal then
+        t_pin._follow_pinning = nil
+      end
       if hiding_terminal then
         return
       end
-      local buf = term.buf
       -- Defer: distinguish intentional stopinsert / <C-\><C-n> (still on this
       -- buffer) from focus leaving the window (keep prior mode, usually "t").
+      local job_gen = terminal_job_gen
       vim.schedule(function()
         if hiding_terminal or applying_ui_state or not terminals[id] then
           return
         end
         local t = terminals[id]
-        -- Nested post-stopinsert view restore still pending: skip so we do not
-        -- clobber ui.view with an intermediate layout.
-        if t._view_restore_gen then
-          return
-        end
-        if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
+        local still_owner = terminal_job_buf == buf and terminal_job_gen == job_gen
+        -- Nested post-stopinsert view restore still pending, or follow owns
+        -- the cursor: do not clobber ui.view. The owner clear below still runs.
+        if not t._view_restore_gen and not t._keep_follow
+          and vim.api.nvim_buf_is_valid(buf)
+          and vim.api.nvim_get_current_buf() == buf then
           save_ui_state(id, "n")
+        end
+        -- Clear even when focus already left. The owner buffer's TermLeave is
+        -- the one that scheduled this; a newer TermEnter bumps job_gen.
+        if still_owner then
+          terminal_job_buf = nil
         end
       end)
     end,
@@ -1063,10 +1670,58 @@ local function create_terminal_instance(id, config, command, display_mode)
         return
       end
       local t = terminals[id]
-      if not t or not t.ui_state or t.ui_state.mode ~= "n" then
+      if not t or not t.ui_state then
+        return
+      end
+      -- This window's job-mode cursor is the TUI row, often not the last
+      -- line. Ignore "t" only then. Another terminal's job mode must not
+      -- hide a scroll here. "nt" can still end follow. An invalid t.win is
+      -- not this window, so it must not take this return.
+      local mode = vim.api.nvim_get_mode().mode
+      if mode == "t"
+        and t.win
+        and vim.api.nvim_win_is_valid(t.win)
+        and vim.api.nvim_get_current_win() == t.win then
+        return
+      end
+      -- Same-buffer job-mode unfocus: term.win stays on the TUI row until
+      -- TermLeave winrestview clears the stash. Ignore it the same way as
+      -- _follow_pinning, including the view snapshot below.
+      if unfocus_dest_restore_pending(t, t.win) then
+        return
+      end
+      if t._keep_follow then
+        -- Output tailing keeps this cursor on the last line, focused or not.
+        -- A scroll moves it off that line and ends follow. _follow_pinning
+        -- covers only this terminal's stopinsert-to-TermLeave gap, so
+        -- terminal_check_cursor's TUI row is not a scroll. Another terminal's
+        -- restore must not hide a scroll here. A missing window must not:
+        -- cursor_on_last_line is false for an invalid win.
+        if unfocusing
+          or t._follow_pinning
+          or not t.win
+          or not vim.api.nvim_win_is_valid(t.win)
+          or cursor_on_last_line(t.win, t.buf) then
+          return
+        end
+        -- Not this window's job (mode ~= "t", or "t" in another terminal).
+        -- Snapshot before a follow-pin retry can pull the cursor back.
+        t._keep_follow = nil
+        t._follow_pinning = nil
+        t.ui_state.mode = "n"
+        local view = capture_view(t.win)
+        if view then
+          t.ui_state.view = view
+        end
+        if t._follow_pin_gen and t._follow_pin_gen == t._ui_apply_gen then
+          finish_ui_apply(t, t._follow_pin_gen)
+        end
         return
       end
       if t._view_restore_gen or suppress_winenter_restore(t) then
+        return
+      end
+      if t.ui_state.mode ~= "n" then
         return
       end
       local view = capture_view(t.win)
@@ -1086,7 +1741,7 @@ local function create_terminal_instance(id, config, command, display_mode)
         return
       end
       local t = terminals[id]
-      if not t or not t.ui_state or t.ui_state.mode ~= "n" then
+      if not t or t._keep_follow or not t.ui_state or t.ui_state.mode ~= "n" then
         return
       end
       local view = capture_view(t.win)
@@ -1102,11 +1757,25 @@ local function create_terminal_instance(id, config, command, display_mode)
   vim.api.nvim_create_autocmd("WinEnter", {
     buffer = term.buf,
     callback = function()
+      -- terminal_check_focus() keeps job mode across a window change that
+      -- does not stopinsert, without a new TermEnter. The window we landed
+      -- on is in job mode, including during hide(). Own it and end follow.
+      -- unfocus() is still inside its switch; the destination must not steal
+      -- the record. apply_ui_state is about to re-pin a normal-mode follow.
+      if not unfocusing and not applying_ui_state and vim.api.nvim_get_mode().mode == "t" then
+        remember_terminal_job(term.buf)
+        local entered = terminals[id]
+        if entered then
+          entered._keep_follow = nil
+          ensure_ui_state(entered).mode = "t"
+        end
+      end
       if hiding_terminal or applying_ui_state then
         return
       end
       local t = terminals[id]
-      if not t or not t.ui_state or t.ui_state.mode ~= "n" then
+      -- Follow keeps the live end. Restoring ui.view would jump to a stale line.
+      if not t or t._keep_follow or not t.ui_state or t.ui_state.mode ~= "n" then
         return
       end
       if suppress_winenter_restore(t) then
@@ -1224,6 +1893,13 @@ local function create_terminal_instance(id, config, command, display_mode)
         })
       end
     end
+  end
+
+  -- show() ran before these autocmds existed. terminal_check_focus() can
+  -- already be in job mode on this buffer, so TermEnter/WinEnter never saw
+  -- the switch and a later startinsert will not fire TermEnter either.
+  if vim.api.nvim_get_current_buf() == term.buf and vim.api.nvim_get_mode().mode == "t" then
+    remember_terminal_job(term.buf)
   end
 
   vim.schedule(function() vim.cmd("startinsert") end)
