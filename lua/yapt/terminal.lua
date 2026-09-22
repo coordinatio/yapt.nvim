@@ -1417,12 +1417,20 @@ local function adopt_visible_split(term)
     end
   end
 
-  term.win = win
   -- The already-displayed branch of reuse_split_window only focuses; it does
   -- not swap buffers. Put the new terminal buffer in the slot here.
-  with_preserved_ui_intent(term, function()
-    vim.api.nvim_win_set_buf(win, term.buf)
+  -- Own the window only after the swap. A failed set_buf must leave the
+  -- donor session attached to this split.
+  local swapped = pcall(function()
+    with_preserved_ui_intent(term, function()
+      vim.api.nvim_win_set_buf(win, term.buf)
+    end)
   end)
+  if not swapped then
+    donor.win = win
+    return
+  end
+  term.win = win
 end
 
 -- Create a new terminal instance (reusable function for creating terminals).
