@@ -1364,6 +1364,75 @@ local function apply_trimmed_yank_register()
   end
 end
 
+-- Hand a new split terminal an already-visible split window in this tab so
+-- create does not open a third pane beside the current buffer. The donor
+-- session stays running; only its window handle is cleared (hide() would
+-- close the slot). Extra visible splits in this tab are hidden.
+-- A window counts only while it still shows that terminal's buffer. After
+-- :b the handle can point at a file; stealing it would replace the file.
+local function adopt_visible_split(term)
+  sync_fullscreen_state()
+  local visible = {}
+  for id, _ in pairs(terminals) do
+    local tracked = terminals[id]
+    local shows_terminal = is_visible(id)
+      and tracked.buf ~= nil
+      and vim.api.nvim_win_get_buf(tracked.win) == tracked.buf
+    if id ~= term.id and shows_terminal then
+      local is_fullscreen = fullscreen_state.active and fullscreen_state.terminal_id == id
+      if not is_fullscreen then
+        table.insert(visible, id)
+      end
+    end
+  end
+  if #visible == 0 then
+    return
+  end
+  -- pairs() order is undefined. Sort so a tie among non-current windows
+  -- always picks the same id.
+  table.sort(visible)
+
+  local current_win = vim.api.nvim_get_current_win()
+  local keep_id = nil
+  local other_id = nil
+  for _, id in ipairs(visible) do
+    if id == active_id then
+      keep_id = id
+    elseif terminals[id].win ~= current_win then
+      other_id = other_id or id
+    end
+  end
+  -- Active visible split, else a split that is not the focused window,
+  -- else the only remaining visible split (the current window).
+  keep_id = keep_id or other_id or visible[1]
+
+  local donor = terminals[keep_id]
+  local win = donor.win
+  save_ui_state(keep_id)
+  donor.win = nil
+
+  for _, id in ipairs(visible) do
+    if id ~= keep_id then
+      hide(id)
+    end
+  end
+
+  -- The already-displayed branch of reuse_split_window only focuses; it does
+  -- not swap buffers. Put the new terminal buffer in the slot here.
+  -- Own the window only after the swap. A failed set_buf must leave the
+  -- donor session attached to this split.
+  local swapped = pcall(function()
+    with_preserved_ui_intent(term, function()
+      vim.api.nvim_win_set_buf(win, term.buf)
+    end)
+  end)
+  if not swapped then
+    donor.win = win
+    return
+  end
+  term.win = win
+end
+
 -- Create a new terminal instance (reusable function for creating terminals).
 -- @param id string Terminal ID
 -- @param config table Plugin config
@@ -1391,6 +1460,7 @@ local function create_terminal_instance(id, config, command, display_mode)
   if display_mode == "fullscreen" then
     show_fullscreen(id)
   else
+    adopt_visible_split(term)
     show(id, config)
   end
 
