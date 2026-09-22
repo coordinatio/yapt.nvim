@@ -1364,6 +1364,49 @@ local function apply_trimmed_yank_register()
   end
 end
 
+-- Hand a new split terminal an already-visible split window in this tab so
+-- create does not open a third pane beside the current buffer. The donor
+-- session stays running; only its window handle is cleared (hide() would
+-- close the slot). Extra visible splits in this tab are hidden.
+local function adopt_visible_split(term)
+  sync_fullscreen_state()
+  local visible = {}
+  local keep_id = nil
+  for id, _ in pairs(terminals) do
+    if id ~= term.id and is_visible(id) then
+      local is_fullscreen = fullscreen_state.active and fullscreen_state.terminal_id == id
+      if not is_fullscreen then
+        table.insert(visible, id)
+        if id == active_id then
+          keep_id = id
+        end
+      end
+    end
+  end
+  if #visible == 0 then
+    return
+  end
+  keep_id = keep_id or visible[1]
+
+  local donor = terminals[keep_id]
+  local win = donor.win
+  save_ui_state(keep_id)
+  donor.win = nil
+
+  for _, id in ipairs(visible) do
+    if id ~= keep_id then
+      hide(id)
+    end
+  end
+
+  term.win = win
+  -- The already-displayed branch of reuse_split_window only focuses; it does
+  -- not swap buffers. Put the new terminal buffer in the slot here.
+  with_preserved_ui_intent(term, function()
+    vim.api.nvim_win_set_buf(win, term.buf)
+  end)
+end
+
 -- Create a new terminal instance (reusable function for creating terminals).
 -- @param id string Terminal ID
 -- @param config table Plugin config
@@ -1391,6 +1434,7 @@ local function create_terminal_instance(id, config, command, display_mode)
   if display_mode == "fullscreen" then
     show_fullscreen(id)
   else
+    adopt_visible_split(term)
     show(id, config)
   end
 
