@@ -1371,22 +1371,34 @@ end
 local function adopt_visible_split(term)
   sync_fullscreen_state()
   local visible = {}
-  local keep_id = nil
   for id, _ in pairs(terminals) do
     if id ~= term.id and is_visible(id) then
       local is_fullscreen = fullscreen_state.active and fullscreen_state.terminal_id == id
       if not is_fullscreen then
         table.insert(visible, id)
-        if id == active_id then
-          keep_id = id
-        end
       end
     end
   end
   if #visible == 0 then
     return
   end
-  keep_id = keep_id or visible[1]
+  -- pairs() order is undefined. Sort so a tie among non-current windows
+  -- always picks the same id.
+  table.sort(visible)
+
+  local current_win = vim.api.nvim_get_current_win()
+  local keep_id = nil
+  local other_id = nil
+  for _, id in ipairs(visible) do
+    if id == active_id then
+      keep_id = id
+    elseif terminals[id].win ~= current_win then
+      other_id = other_id or id
+    end
+  end
+  -- Active visible split, else a split that is not the focused window,
+  -- else the only remaining visible split (the current window).
+  keep_id = keep_id or other_id or visible[1]
 
   local donor = terminals[keep_id]
   local win = donor.win
