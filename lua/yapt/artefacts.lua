@@ -338,8 +338,18 @@ end
 -- Nil when the setting is refused (the caller is notified).
 local function resolve_artefacts_dir(cfg)
   local dir = cfg and cfg.artefacts and cfg.artefacts.dir
-  if type(dir) ~= "string" or dir == "" then
+  if dir == nil then
     dir = DEFAULT_DIR
+  elseif type(dir) ~= "string" then
+    util.notify("Artefact directory must be a string", vim.log.levels.WARN)
+    return nil
+  elseif dir == "" then
+    -- An empty string disables artefacts, like prompts.dir.
+    util.notify(
+      "Artefact directory is not configured (artefacts.dir is empty)",
+      vim.log.levels.WARN
+    )
+    return nil
   end
   local expanded, err = expand_configured_dir(dir)
   if not expanded then
@@ -479,14 +489,23 @@ local function normalize_name(raw)
     return nil
   end
 
+  -- Leading dots go before the extension split, so ".notes" becomes
+  -- "notes.md" and ".notes.json" keeps ".json". "." and ".." reduce to
+  -- nothing and are refused below.
+  name = name:gsub("^%.+", "")
+  if name == "" then
+    return nil
+  end
+
   name = name:gsub("%s+", "-")
-  -- "$" and "`" as well: an unquoted shell expands both.
-  -- Other punctuation is left as it was.
-  name = name:gsub("[%z%c/\\:*?\"<>|$`]", "-")
+  -- Characters an unquoted shell treats as expansion, quoting, globbing, or
+  -- command separators are replaced too. Spaces are already handled above.
+  -- Other punctuation ("%", "=", "~", "#", "@", ",") is left as it was.
+  name = name:gsub("[%z%c/\\:*?\"<>|$`&;()'!%[%]{}]", "-")
   name = name:gsub("%-+", "-")
 
-  -- Extension before stripping leading dots, so ".json" is not rewritten
-  -- into a stem of "json".
+  -- The extension is taken before the trailing stem strip below, so a real
+  -- extension stays an extension instead of folding into the stem.
   local stem, ext = name:match("^(.*)(%.[A-Za-z0-9]+)$")
   local ext_len = ext and (#ext - 1) or 0
   local keep_ext = stem

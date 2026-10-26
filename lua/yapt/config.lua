@@ -33,6 +33,7 @@ M.defaults = {
   },
 
   -- Temporary files the agent should create (not committed; under .nvim-yapt/)
+  -- dir nil → the default below. Empty string disables artefacts.
   artefacts = {
     dir = ".nvim-yapt/artefacts", -- Relative to CWD
   },
