@@ -89,6 +89,8 @@ end
 
 -- "$VAR" / "${VAR}" in one left-to-right pass. Each value is inserted
 -- literally. A value with a glob or a "." / ".." segment is refused.
+-- An absolute value ("/" or "~...") must be the whole directory: if any
+-- path text already precedes it, cache/$DIR would collapse under the cwd.
 -- @return string|nil expanded, string|nil warning
 local function expand_vars(s)
   local parts = {}
@@ -108,6 +110,10 @@ local function expand_vars(s)
       end
       if has_dot_segment(val) then
         return nil, "Artefact directory variable value contains a '.' or '..' path segment: $" .. var
+      end
+      local first = val:sub(1, 1)
+      if (first == "/" or first == "~") and table.concat(parts) ~= "" then
+        return nil, "Artefact directory variable is absolute and is not the whole directory: $" .. var
       end
       parts[#parts + 1] = val
       i = i + (braced and (3 + #var) or (1 + #var))
@@ -446,8 +452,9 @@ local function ensure_artefacts_dir(config)
     return nil
   end
   -- An existing directory is not success when the agent cannot create the file.
-  -- nil/error from fs_access is not a refusal; listing may still read it.
-  if vim.uv.fs_access(reserved, "W") == false then
+  -- Creating a file needs write and execute. nil/error from fs_access is not
+  -- a refusal; listing may still read it.
+  if vim.uv.fs_access(reserved, "WX") == false then
     util.notify("Artefact directory is not writable: " .. reserved, vim.log.levels.WARN)
     return nil
   end
@@ -1175,13 +1182,28 @@ function M.open_artefacts_in_telescope(config)
     temp__scrolling_limit = 100000,
     previewer = artefact_previewer,
     attach_mappings = function(prompt_bufnr, _map)
-      actions.select_default:replace(function()
+      -- Literal Ex args. Telescope's select_* normalizes against the process
+      -- cwd and fnameescape's the result, so :lcd / :tcd opens another file
+      -- and a newline can split the command.
+      local function open_path(command)
         actions.close(prompt_bufnr)
         local selection = action_state.get_selected_entry()
         local path = selection and selection.path
         if type(path) == "string" and path ~= "" then
-          vim.cmd.edit({ args = { path }, magic = { file = false, bar = false } })
+          command({ args = { path }, magic = { file = false, bar = false } })
         end
+      end
+      actions.select_default:replace(function()
+        open_path(vim.cmd.edit)
+      end)
+      actions.select_horizontal:replace(function()
+        open_path(vim.cmd.new)
+      end)
+      actions.select_vertical:replace(function()
+        open_path(vim.cmd.vnew)
+      end)
+      actions.select_tab:replace(function()
+        open_path(vim.cmd.tabedit)
       end)
       return true
     end,
