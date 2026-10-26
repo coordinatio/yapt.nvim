@@ -200,6 +200,15 @@ local function global_cwd()
   return strip_trailing_slash(cwd)
 end
 
+-- Window/tab cwd (:lcd / :tcd). A new :! or termopen inherits this process cwd.
+local function effective_cwd()
+  local cwd = vim.fn.getcwd()
+  if type(cwd) ~= "string" or cwd == "" then
+    return ""
+  end
+  return strip_trailing_slash(cwd)
+end
+
 -- Collapse "." / ".." and duplicate slashes. Does not resolve symlinks and
 -- does not expand environment variables. A leading "~" is returned unchanged
 -- so vim.fs.normalize cannot paste the current home onto "~user".
@@ -228,6 +237,27 @@ local function lexical_absolute(expanded)
     end
   end
   return norm
+end
+
+-- Lexical identity, or both realpaths exist and name the same directory.
+-- A missing realpath is not a match. "." is not a directory identity.
+local function same_directory(a, b)
+  if type(a) ~= "string" or a == "" or type(b) ~= "string" or b == "" then
+    return false
+  end
+  local la = lexical_normalize(a)
+  local lb = lexical_normalize(b)
+  if la ~= "" and la ~= "." and la == lb then
+    return true
+  end
+  local ra = vim.uv.fs_realpath(a)
+  local rb = vim.uv.fs_realpath(b)
+  if type(ra) ~= "string" or ra == "" or type(rb) ~= "string" or rb == "" then
+    return false
+  end
+  ra = lexical_normalize(ra)
+  rb = lexical_normalize(rb)
+  return ra ~= "" and ra ~= "." and ra == rb
 end
 
 -- True when `path` is the global cwd or the realpath of that cwd.
@@ -278,7 +308,27 @@ local function resolve_artefacts_dir(cfg)
     util.notify(err, vim.log.levels.WARN)
     return nil
   end
+  -- nvim_buf_set_text rejects these. Refuse before mkdir or insert.
+  -- Spaces stay; they do not break the insert.
+  local function has_break_byte(path)
+    return type(path) == "string"
+      and (path:find("\0", 1, true) or path:find("\r", 1, true) or path:find("\n", 1, true))
+  end
+  if has_break_byte(expanded) then
+    util.notify(
+      "Artefact directory contains a newline, carriage return, or NUL",
+      vim.log.levels.WARN
+    )
+    return nil
+  end
   local lexical_abs = lexical_absolute(expanded)
+  if has_break_byte(lexical_abs) then
+    util.notify(
+      "Artefact directory contains a newline, carriage return, or NUL",
+      vim.log.levels.WARN
+    )
+    return nil
+  end
   if lexical_abs == "/" then
     util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
     return nil
@@ -306,11 +356,16 @@ local function reserved_directory(lexical_abs)
   return lexical_abs
 end
 
--- Relative form only when it is the directory that was reserved. A symlink
--- (realpath differs), an absolute setting, or a "." / ".." segment uses the
--- canonical absolute directory instead.
+-- Relative form only when it is the directory that was reserved and the
+-- effective cwd (:lcd / :tcd) is still the global cwd that relative text is
+-- resolved against. A symlink (realpath differs), an absolute setting, a
+-- "." / ".." segment, or a different window/tab directory uses the canonical
+-- absolute directory instead.
 local function shown_directory(info, reserved)
-  if info.relative and reserved == info.lexical_abs then
+  if info.relative
+    and reserved == info.lexical_abs
+    and same_directory(effective_cwd(), global_cwd())
+  then
     return info.relative
   end
   return reserved
@@ -985,8 +1040,23 @@ function M.open_artefacts_in_telescope(config)
   end
 
   local base_sorter = conf.file_sorter({})
+  -- Picker lifecycle runs on this wrapper. fzf-native stores its slab and
+  -- prompt cache in init and frees them in destroy; call those on the base
+  -- sorter or the first typed query indexes an uninitialized state.
+  local function forward_to_base(method)
+    if type(base_sorter[method]) ~= "function" then
+      return nil
+    end
+    return function(_, ...)
+      return base_sorter[method](base_sorter, ...)
+    end
+  end
   local chronological_sorter = sorters.Sorter:new({
     discard = base_sorter.discard,
+    init = forward_to_base("init"),
+    start = forward_to_base("start"),
+    finish = forward_to_base("finish"),
+    destroy = forward_to_base("destroy"),
     scoring_function = function(_, prompt, line, entry, cb_add, cb_filter)
       if not prompt or prompt == "" then
         return 1
@@ -1005,7 +1075,17 @@ function M.open_artefacts_in_telescope(config)
     title = "Artefact preview",
     define_preview = function(self, entry, _status)
       local lines = literal_preview_lines(entry and entry.path)
-      pcall(vim.api.nvim_buf_set_lines, self.state.bufnr, 0, -1, false, lines)
+      local bufnr = self.state.bufnr
+      pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, lines)
+      -- Basename only. vim.filetype.match must not see the full path, so a
+      -- name containing "$" is not passed through path_expand or expand().
+      local name = entry and entry.value
+      if type(name) == "string" and name ~= "" and vim.api.nvim_buf_is_valid(bufnr) then
+        local ok, ft = pcall(vim.filetype.match, { filename = name, buf = bufnr })
+        if ok and type(ft) == "string" and ft ~= "" then
+          vim.bo[bufnr].filetype = ft
+        end
+      end
       util.apply_wrap(self.state.winid)
     end,
   })
