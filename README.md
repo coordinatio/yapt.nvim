@@ -169,8 +169,8 @@ Prompt-file buffers are automatically saved to disk when you leave them (switch 
 Point an agent at a throwaway file (a report, a dump) without putting it under version control. Paths land in `${CWD}/.nvim-yapt/artefacts/`, next to prompt history. The file is not created when you insert the path — the agent writes it. The directory is created so that write has somewhere to go.
 
 1. While editing a prompt, press `<leader>aa` or run `:PTArtefact`.
-2. Enter a name (or pass it as `:PTArtefact weekly report`). The name becomes a single filename: whitespace turns into `-`, and characters that cannot live in a path component are dropped. Letters, including non-ASCII, and case stay. A short extension you type (`data.json`) is kept; otherwise `.md` is added.
-3. The path is inserted at the cursor, for example `.nvim-yapt/artefacts/2026-10-26_11-15-03_weekly-report.md`. The same second and name get `_1`, `_2`, … before the extension when that file is already on disk. An absolute `artefacts.dir` is inserted as an absolute path.
+2. Enter a name (or pass it as `:PTArtefact weekly report`). The name becomes a single filename: whitespace turns into `-`, and characters that cannot live in a path component are replaced with `-`. Letters, including non-ASCII, and case stay. A short extension you type is kept only when it contains a letter (`data.json`); otherwise `.md` is added.
+3. The path is inserted at the cursor, for example `.nvim-yapt/artefacts/2026-10-26_11-15-03_weekly-report.md`. The same second and name get `_1`, `_2`, … before the extension when that path was already inserted in this session or the name is already taken on disk. An absolute `artefacts.dir` is inserted as an absolute path. `~/` and environment variables in `artefacts.dir` are expanded.
 
 Browse files the agent has already written with `:PTArtefacts` or `<leader>aA` (Telescope, newest first, wrap preview). Any non-hidden file in the directory is listed, not only markdown.
 

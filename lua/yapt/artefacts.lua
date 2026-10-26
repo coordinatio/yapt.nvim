@@ -11,21 +11,53 @@ local util = require("yapt.util")
 local M = {}
 
 local DEFAULT_DIR = ".nvim-yapt/artefacts"
--- Dot plus this many ASCII letters/digits still counts as a typed extension.
+-- A typed extension of this many ASCII letters/digits is kept only when it
+-- contains at least one letter.
 local MAX_EXT_LEN = 10
+local NAME_MAX = 255
+-- Room for "_9999" so a truncated stem still fits the longest suffix we try.
+local COLLISION_RESERVE = "_9999"
+local MAX_COLLISION_SUFFIX = 1000
+
+-- Absolute paths this process has already handed out. The file is not created,
+-- so a second insert in the same second must still see the first reservation.
+local reserved_paths = {}
+
+-- U+00A0, U+2000–U+200A, U+202F, U+205F, U+3000. Lua character classes are
+-- bytes, so each codepoint is substituted on its own.
+local unicode_spaces = {}
+local function add_unicode_space(cp)
+  unicode_spaces[#unicode_spaces + 1] = vim.fn.nr2char(cp)
+end
+add_unicode_space(0x00A0)
+for cp = 0x2000, 0x200A do
+  add_unicode_space(cp)
+end
+add_unicode_space(0x202F)
+add_unicode_space(0x205F)
+add_unicode_space(0x3000)
 
 local function configured_dir(cfg)
   local dir = cfg and cfg.artefacts and cfg.artefacts.dir
   if type(dir) ~= "string" or dir == "" then
     dir = DEFAULT_DIR
   end
-  return dir:gsub("/+$", "")
+  -- Expand before the absolute check, same as preset directories.
+  -- "/" and "///" strip to empty; fall back so we never mkdir or insert at root.
+  dir = vim.fn.expand(dir)
+  dir = dir:gsub("/+$", "")
+  if dir == "" then
+    return DEFAULT_DIR
+  end
+  return dir
 end
 
 -- Absolute directory used for mkdir and collision checks.
+-- Relative configured_dir stays relative in the inserted text; getcwd() is
+-- only applied here.
 local function artefacts_dir_path(cfg)
   local dir = configured_dir(cfg)
-  if dir:match("^/") then
+  if vim.fn.isabsolutepath(dir) == 1 then
     return dir
   end
   return vim.fn.getcwd() .. "/" .. dir
@@ -42,36 +74,54 @@ local function ensure_artefacts_dir(config)
   return dir
 end
 
--- One filename component: whitespace to "-", drop path/control characters,
--- keep letters (including non-ASCII) and case. A short ASCII extension is
--- kept; otherwise ".md" is added. Nil when nothing usable remains.
+local function replace_unicode_spaces(name)
+  for _, ch in ipairs(unicode_spaces) do
+    name = name:gsub(ch, " ")
+  end
+  return name
+end
+
+-- One filename component: whitespace to "-", forbidden characters to "-".
+-- Letters (including non-ASCII) and case stay. A short ASCII extension is
+-- kept only when it contains a letter; otherwise ".md" is added.
+-- Nil when nothing usable remains (caller warns).
 -- @param raw string
 -- @return string|nil
 local function normalize_name(raw)
   if type(raw) ~= "string" then
     return nil
   end
-  local name = vim.trim(raw)
+  local name = replace_unicode_spaces(raw)
+  name = vim.trim(name)
   if name == "" then
     return nil
   end
 
   name = name:gsub("%s+", "-")
-  name = name:gsub("[%z%c/\\:*?\"<>|]", "")
+  name = name:gsub("[%z%c/\\:*?\"<>|]", "-")
   name = name:gsub("%-+", "-")
-  name = name:gsub("^[-.]+", ""):gsub("[-.]+$", "")
-  if name == "" then
-    return nil
-  end
 
+  -- Extension before stripping leading dots, so ".json" is not rewritten
+  -- into a stem of "json".
   local stem, ext = name:match("^(.*)(%.[A-Za-z0-9]+)$")
-  if stem and stem ~= "" and ext and (#ext - 1) <= MAX_EXT_LEN then
-    stem = stem:gsub("^[-.]+", ""):gsub("[-.]+$", "")
-    stem = stem:gsub("%-+", "-"):gsub("^-+", ""):gsub("-+$", "")
-  else
+  local ext_len = ext and (#ext - 1) or 0
+  local keep_ext = stem
+    and ext
+    and ext_len >= 1
+    and ext_len <= MAX_EXT_LEN
+    and ext:match("[A-Za-z]")
+  if not keep_ext then
     stem = name
     ext = ".md"
   end
+
+  -- Stem only: "foo . bar" became "foo-.-bar"; collapse that run.
+  -- Leave real dots ("foo.bar" of "foo.bar.md") in place.
+  while stem:find("%-%.%-") do
+    stem = stem:gsub("%-%.%-", "-")
+  end
+  stem = stem:gsub("%-+", "-")
+  stem = stem:gsub("^[-.]+", ""):gsub("[-.]+$", "")
 
   if stem == "" then
     return nil
@@ -79,11 +129,84 @@ local function normalize_name(raw)
   return stem .. ext
 end
 
+local function absolute_path(path)
+  return vim.fn.fnamemodify(path, ":p")
+end
+
+local function buffer_named(abs)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name ~= "" and absolute_path(name) == abs then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- "taken", "free", or "error". ENOENT is free. Any other lstat failure
+-- (ENAMETOOLONG, EACCES, …) is an error so it cannot look like a free name.
+-- A successful lstat is taken for every dirent, including a broken symlink.
+local function reservation_state(abs)
+  if reserved_paths[abs] then
+    return "taken"
+  end
+  local st, err, errname = vim.uv.fs_lstat(abs)
+  if st then
+    return "taken"
+  end
+  if errname ~= "ENOENT" then
+    return "error", err or errname or "stat failed"
+  end
+  if buffer_named(abs) then
+    return "taken"
+  end
+  return "free"
+end
+
+-- Drop bytes past max_bytes without splitting a UTF-8 sequence.
+-- A sequence that ends on max_bytes is kept; one that would run past it is not.
+local function truncate_utf8(s, max_bytes)
+  if max_bytes <= 0 then
+    return ""
+  end
+  if #s <= max_bytes then
+    return s
+  end
+  local rel = vim.str_utf_start(s, max_bytes)
+  if type(rel) ~= "number" then
+    return s:sub(1, max_bytes)
+  end
+  local start_idx = max_bytes + math.min(rel, 0)
+  if start_idx < 1 then
+    return ""
+  end
+  local b = s:byte(start_idx)
+  local len = 1
+  if b >= 0xF0 then
+    len = 4
+  elseif b >= 0xE0 then
+    len = 3
+  elseif b >= 0xC0 then
+    len = 2
+  end
+  local end_idx = start_idx + len - 1
+  if end_idx > max_bytes then
+    end_idx = start_idx - 1
+  end
+  if end_idx < 1 then
+    return ""
+  end
+  return s:sub(1, end_idx)
+end
+
 -- YYYY-MM-DD_HH-MM-SS_<normalized>, with _1, _2, ... before the extension
--- when that path is already on disk.
+-- when that absolute path is reserved, already a dirent, or already a buffer name.
 -- @param dir string absolute artefacts directory
 -- @param normalized string filename from normalize_name
--- @return string basename
+-- @return string|nil basename
+-- @return string|nil warning when no name is returned
 local function unique_artefact_filename(dir, normalized)
   local stem, ext = normalized:match("^(.*)(%.[^%.]+)$")
   if not stem or stem == "" then
@@ -91,16 +214,32 @@ local function unique_artefact_filename(dir, normalized)
     ext = ""
   end
   local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+  local fixed = #stamp + 1 + #COLLISION_RESERVE + #ext
+  if fixed > NAME_MAX then
+    return nil, "Artefact filename is too long"
+  end
+  stem = truncate_utf8(stem, NAME_MAX - fixed)
+  if stem == "" then
+    return nil, "Artefact filename is too long"
+  end
+
   local function named(suffix)
     return stamp .. "_" .. stem .. suffix .. ext
   end
-  local filename = named("")
-  local n = 1
-  while vim.uv.fs_stat(dir .. "/" .. filename) ~= nil do
-    filename = named("_" .. n)
-    n = n + 1
+
+  for n = 0, MAX_COLLISION_SUFFIX do
+    local filename = named(n == 0 and "" or ("_" .. n))
+    local abs = absolute_path(dir .. "/" .. filename)
+    local state, err = reservation_state(abs)
+    if state == "error" then
+      return nil, "Could not check artefact path: " .. tostring(err)
+    end
+    if state == "free" then
+      reserved_paths[abs] = true
+      return filename
+    end
   end
-  return filename
+  return nil, "Could not find a free artefact filename"
 end
 
 -- Relative (or absolute, when artefacts.dir is absolute) path to insert.
@@ -117,7 +256,11 @@ local function build_artefact_link(config, raw_name)
   if not dir then
     return nil
   end
-  local filename = unique_artefact_filename(dir, normalized)
+  local filename, err = unique_artefact_filename(dir, normalized)
+  if not filename then
+    util.notify(err, vim.log.levels.WARN)
+    return nil
+  end
   return configured_dir(config) .. "/" .. filename
 end
 
@@ -189,7 +332,9 @@ local function insert_text_at_cursor(text, loc, cursor, winid)
     return false
   end
 
-  if view_buf then
+  -- A Reader/Float view is not the source file. Closing every float that
+  -- shows the source would dismiss an unrelated window on a normal edit.
+  if view_buf and view_buf ~= source_buf then
     util.close_float_view_if_needed(view_buf)
   end
 
@@ -262,39 +407,91 @@ function M.insert_artefact_link(config, name)
   return nil
 end
 
--- Timestamp prefix YYYY-MM-DD_HH-MM-SS, optional collision suffix ignored.
+-- Timestamp prefix YYYY-MM-DD_HH-MM-SS. Impossible dates that os.time would
+-- normalize (month 99, 31 Feb, …) are rejected so the caller can use mtime.
 -- @return number|nil unix time
 local function parse_timestamp_from_filename(filename)
   local y, mo, d, h, mi, s = filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)")
   if not y then
     return nil
   end
-  local ts = os.time({
-    year = tonumber(y),
-    month = tonumber(mo),
-    day = tonumber(d),
-    hour = tonumber(h),
-    min = tonumber(mi),
-    sec = tonumber(s),
+  local year = tonumber(y)
+  local month = tonumber(mo)
+  local day = tonumber(d)
+  local hour = tonumber(h)
+  local min = tonumber(mi)
+  local sec = tonumber(s)
+  if not year or not month or not day or not hour or not min or not sec then
+    return nil
+  end
+  if month < 1 or month > 12 or day < 1 or day > 31 then
+    return nil
+  end
+  if hour > 23 or min > 59 or sec > 59 then
+    return nil
+  end
+  local ok, ts = pcall(os.time, {
+    year = year,
+    month = month,
+    day = day,
+    hour = hour,
+    min = min,
+    sec = sec,
   })
-  if type(ts) ~= "number" then
+  if not ok or type(ts) ~= "number" then
+    return nil
+  end
+  local round = os.date("*t", ts)
+  if type(round) ~= "table"
+    or round.year ~= year
+    or round.month ~= month
+    or round.day ~= day
+    or round.hour ~= hour
+    or round.min ~= min
+    or round.sec ~= sec
+  then
     return nil
   end
   return ts
 end
 
+-- Collision suffix "_N" immediately before the last extension, else 0.
+-- Base is the filename with that "_N" removed, so "_10" and "_2" share a base.
+local function collision_base_and_suffix(filename)
+  local base, n, ext = filename:match("^(.*)_(%d+)(%.[^%.]+)$")
+  if base and n and ext then
+    return base .. ext, tonumber(n)
+  end
+  return filename, 0
+end
+
+local function points_at_regular_file(fullpath)
+  local st = vim.uv.fs_stat(fullpath)
+  return st ~= nil and st.type == "file"
+end
+
+-- Regular files, plus symlinks whose target is a regular file.
+-- Directories, fifos, sockets, and broken symlinks are omitted so preview
+-- cannot block on a fifo.
 local function is_listed_artefact(name, fullpath)
   if name == "" or name:sub(1, 1) == "." then
     return false
   end
-  if vim.fn.isdirectory(fullpath) == 1 then
+  local lst = vim.uv.fs_lstat(fullpath)
+  if not lst then
     return false
   end
-  local kind = vim.fn.getftype(fullpath)
-  return kind == "file" or kind == "link"
+  if lst.type == "file" then
+    return true
+  end
+  if lst.type == "link" then
+    return points_at_regular_file(fullpath)
+  end
+  return false
 end
 
--- Newest first. Filename timestamp, then mtime, then name.
+-- Newest first. A filename timestamp that round-trips beats mtime.
+-- Equal timestamps: higher collision suffix, then name.
 local function list_artefact_files_sorted(config)
   config = config or {}
   local dir = artefacts_dir_path(config)
@@ -315,10 +512,13 @@ local function list_artefact_files_sorted(config)
           ts = 0
         end
       end
+      local base, suffix = collision_base_and_suffix(name)
       table.insert(entries, {
         name = name,
         path = fullpath,
         ts = ts,
+        base = base,
+        suffix = suffix,
       })
     end
   end
@@ -326,6 +526,9 @@ local function list_artefact_files_sorted(config)
   table.sort(entries, function(a, b)
     if a.ts ~= b.ts then
       return a.ts > b.ts
+    end
+    if a.base == b.base and a.suffix ~= b.suffix then
+      return a.suffix > b.suffix
     end
     return a.name > b.name
   end)
@@ -343,7 +546,9 @@ function M.open_artefacts_in_telescope(config)
 
   local entries, dir = list_artefact_files_sorted(config)
   if vim.fn.isdirectory(dir) ~= 1 then
-    vim.fn.mkdir(dir, "p")
+    if not ensure_artefacts_dir(config) then
+      return
+    end
   end
 
   local pickers = require("telescope.pickers")
