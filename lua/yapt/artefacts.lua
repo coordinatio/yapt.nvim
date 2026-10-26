@@ -23,8 +23,8 @@ local MAX_COLLISION_SUFFIX = 1000
 -- so a second insert in the same second must still see the first reservation.
 local reserved_paths = {}
 
--- U+00A0, U+2000–U+200A, U+202F, U+205F, U+3000. Lua character classes are
--- bytes, so each codepoint is substituted on its own.
+-- U+00A0, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000.
+-- Lua character classes are bytes, so each codepoint is substituted on its own.
 local unicode_spaces = {}
 local function add_unicode_space(cp)
   unicode_spaces[#unicode_spaces + 1] = vim.fn.nr2char(cp)
@@ -33,52 +33,163 @@ add_unicode_space(0x00A0)
 for cp = 0x2000, 0x200A do
   add_unicode_space(cp)
 end
+add_unicode_space(0x2028)
+add_unicode_space(0x2029)
 add_unicode_space(0x202F)
 add_unicode_space(0x205F)
 add_unicode_space(0x3000)
 
-local function configured_dir(cfg)
-  local dir = cfg and cfg.artefacts and cfg.artefacts.dir
-  if type(dir) ~= "string" or dir == "" then
-    dir = DEFAULT_DIR
-  end
-  -- Expand before the absolute check, same as preset directories.
-  -- "/" and "///" strip to empty; fall back so we never mkdir or insert at root.
-  dir = vim.fn.expand(dir)
-  dir = dir:gsub("/+$", "")
-  if dir == "" then
-    return DEFAULT_DIR
-  end
-  return dir
+-- Format characters that change how a path is displayed (bidi marks, zero-width
+-- joiners, BOM). Replaced with "-" so two titles cannot glue together.
+local unicode_format = {}
+local function add_unicode_format(cp)
+  unicode_format[#unicode_format + 1] = vim.fn.nr2char(cp)
 end
-
--- Absolute directory used for mkdir and collision checks.
--- Relative configured_dir stays relative in the inserted text; getcwd() is
--- only applied here.
-local function artefacts_dir_path(cfg)
-  local dir = configured_dir(cfg)
-  if vim.fn.isabsolutepath(dir) == 1 then
-    return dir
-  end
-  return vim.fn.getcwd() .. "/" .. dir
+for cp = 0x200B, 0x200F do
+  add_unicode_format(cp)
 end
-
--- @return string|nil directory, or nil when mkdir fails
-local function ensure_artefacts_dir(config)
-  local dir = artefacts_dir_path(config)
-  pcall(vim.fn.mkdir, dir, "p")
-  if vim.fn.isdirectory(dir) ~= 1 then
-    util.notify("Failed to create artefacts directory: " .. dir, vim.log.levels.ERROR)
-    return nil
-  end
-  return dir
+for cp = 0x202A, 0x202E do
+  add_unicode_format(cp)
 end
+for cp = 0x2066, 0x2069 do
+  add_unicode_format(cp)
+end
+add_unicode_format(0xFEFF)
 
 local function replace_unicode_spaces(name)
   for _, ch in ipairs(unicode_spaces) do
     name = name:gsub(ch, " ")
   end
   return name
+end
+
+local function replace_unicode_format(name)
+  for _, ch in ipairs(unicode_format) do
+    name = name:gsub(ch, "-")
+  end
+  return name
+end
+
+-- Leading "~", "~/...", or "~user" only. "$VAR" / "${VAR}" only when set and
+-- non-empty. No wildcards, "%", "#", or "<".
+-- @return string|nil expanded, string|nil warning
+local function expand_configured_dir(dir)
+  if dir:find("[%*%?%[]") then
+    return nil, "Artefact directory contains a glob character: " .. dir
+  end
+
+  if dir:sub(1, 1) == "~" then
+    local home, rest
+    if dir == "~" or dir:sub(2, 2) == "/" then
+      home = vim.uv.os_homedir()
+      rest = dir:sub(2)
+    else
+      local user, tail = dir:match("^~([^/]+)(.*)$")
+      if not user or user == "" or not user:match("^[%w._-]+$") then
+        return nil, "Artefact directory ~ could not be expanded"
+      end
+      local token = "~" .. user
+      -- Only the ~user token, so expand cannot see "$", "%", "#", or globs.
+      home = vim.fn.expand(token)
+      if type(home) ~= "string" or home == "" or home == token then
+        return nil, "Artefact directory " .. token .. " could not be expanded"
+      end
+      rest = tail
+    end
+    if type(home) ~= "string" or home == "" then
+      return nil, "Artefact directory ~ could not be expanded"
+    end
+    dir = home:gsub("/+$", "") .. rest
+  end
+
+  -- One left-to-right pass. A value is inserted literally, so it cannot
+  -- introduce another variable or a wildcard for a second expansion.
+  local parts = {}
+  local i = 1
+  while i <= #dir do
+    local rest = dir:sub(i)
+    local braced = rest:match("^%${([%w_]+)}")
+    local bare = (not braced) and rest:match("^%$([%w_]+)") or nil
+    local var = braced or bare
+    if var then
+      local val = vim.uv.os_getenv(var)
+      if type(val) ~= "string" or val == "" then
+        return nil, "Artefact directory variable is unset or empty: $" .. var
+      end
+      parts[#parts + 1] = val
+      i = i + (braced and (3 + #var) or (1 + #var))
+    else
+      parts[#parts + 1] = dir:sub(i, i)
+      i = i + 1
+    end
+  end
+  return table.concat(parts)
+end
+
+-- @return string|nil directory to insert / join, or nil when the setting is refused
+local function configured_dir(cfg)
+  local dir = cfg and cfg.artefacts and cfg.artefacts.dir
+  if type(dir) ~= "string" or dir == "" then
+    dir = DEFAULT_DIR
+  end
+  local expanded, err = expand_configured_dir(dir)
+  if not expanded then
+    util.notify(err, vim.log.levels.WARN)
+    return nil
+  end
+  -- "/" and "///" strip to empty; fall back so we never mkdir or insert at root.
+  expanded = expanded:gsub("/+$", "")
+  if expanded == "" then
+    return DEFAULT_DIR
+  end
+  return expanded
+end
+
+-- Absolute directory used for mkdir and collision checks.
+-- Relative configured_dir stays relative in the inserted text; getcwd() is
+-- only applied here. Nil when the configured directory is refused.
+local function artefacts_dir_path(cfg)
+  local dir = configured_dir(cfg)
+  if not dir then
+    return nil
+  end
+  if vim.fn.isabsolutepath(dir) == 1 then
+    return dir
+  end
+  return vim.fn.getcwd() .. "/" .. dir
+end
+
+-- Lexical absolute path: collapse "." / ".." and duplicate slashes.
+-- Does not resolve symlinks and does not expand environment variables.
+local function normalized_absolute(path)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local norm = vim.fs.normalize(abs, { expand_env = false })
+  if norm ~= "/" then
+    norm = norm:gsub("/+$", "")
+  end
+  return norm
+end
+
+-- Directory identity after mkdir. Prefer the symlink-resolved path so
+-- reservations and buffer names share one key.
+local function canonical_dir(dir)
+  local real = vim.uv.fs_realpath(dir)
+  local chosen = (type(real) == "string" and real ~= "") and real or dir
+  return normalized_absolute(chosen)
+end
+
+-- @return string|nil canonical directory, or nil when mkdir fails or dir is refused
+local function ensure_artefacts_dir(config)
+  local dir = artefacts_dir_path(config)
+  if not dir then
+    return nil
+  end
+  pcall(vim.fn.mkdir, dir, "p")
+  if vim.fn.isdirectory(dir) ~= 1 then
+    util.notify("Failed to create artefacts directory: " .. dir, vim.log.levels.ERROR)
+    return nil
+  end
+  return canonical_dir(dir)
 end
 
 -- One filename component: whitespace to "-", forbidden characters to "-".
@@ -92,6 +203,8 @@ local function normalize_name(raw)
     return nil
   end
   local name = replace_unicode_spaces(raw)
+  -- Format characters become "-" before runs of hyphens are collapsed.
+  name = replace_unicode_format(name)
   name = vim.trim(name)
   if name == "" then
     return nil
@@ -129,26 +242,42 @@ local function normalize_name(raw)
   return stem .. ext
 end
 
-local function absolute_path(path)
-  return vim.fn.fnamemodify(path, ":p")
-end
-
-local function buffer_named(abs)
+-- Paths that name `abs` for reservation purposes.
+-- The normalized absolute name always counts. When the buffer file does not
+-- exist, also count realpath(parent) + basename so ".." and symlinks match
+-- the canonical directory. fnamemodify(..., ":p") alone does neither.
+local function buffer_reservation_paths()
+  local taken = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(buf) then
       local name = vim.api.nvim_buf_get_name(buf)
-      if name ~= "" and absolute_path(name) == abs then
-        return true
+      if name ~= "" then
+        local norm = normalized_absolute(name)
+        taken[norm] = true
+        if vim.uv.fs_lstat(norm) == nil then
+          local parent = vim.fs.dirname(norm)
+          local base = vim.fs.basename(norm)
+          if parent and parent ~= "" and base and base ~= "" then
+            local real_parent = vim.uv.fs_realpath(parent)
+            if type(real_parent) == "string" and real_parent ~= "" then
+              taken[normalized_absolute(real_parent .. "/" .. base)] = true
+            end
+          end
+        end
       end
     end
   end
-  return false
+  return taken
+end
+
+local function canonical_file(dir, filename)
+  return normalized_absolute(dir .. "/" .. filename)
 end
 
 -- "taken", "free", or "error". ENOENT is free. Any other lstat failure
 -- (ENAMETOOLONG, EACCES, …) is an error so it cannot look like a free name.
 -- A successful lstat is taken for every dirent, including a broken symlink.
-local function reservation_state(abs)
+local function reservation_state(abs, buffer_paths)
   if reserved_paths[abs] then
     return "taken"
   end
@@ -159,10 +288,16 @@ local function reservation_state(abs)
   if errname ~= "ENOENT" then
     return "error", err or errname or "stat failed"
   end
-  if buffer_named(abs) then
+  if buffer_paths[abs] then
     return "taken"
   end
   return "free"
+end
+
+local function release_reservation(abs)
+  if type(abs) == "string" then
+    reserved_paths[abs] = nil
+  end
 end
 
 -- Drop bytes past max_bytes without splitting a UTF-8 sequence.
@@ -203,10 +338,12 @@ end
 
 -- YYYY-MM-DD_HH-MM-SS_<normalized>, with _1, _2, ... before the extension
 -- when that absolute path is reserved, already a dirent, or already a buffer name.
--- @param dir string absolute artefacts directory
+-- On success the second return is the canonical absolute path that was reserved.
+-- On failure the second return is a warning. The file is not created.
+-- @param dir string canonical artefacts directory
 -- @param normalized string filename from normalize_name
 -- @return string|nil basename
--- @return string|nil warning when no name is returned
+-- @return string|nil absolute path, or a warning when no name is returned
 local function unique_artefact_filename(dir, normalized)
   local stem, ext = normalized:match("^(.*)(%.[^%.]+)$")
   if not stem or stem == "" then
@@ -227,16 +364,17 @@ local function unique_artefact_filename(dir, normalized)
     return stamp .. "_" .. stem .. suffix .. ext
   end
 
+  local buffer_paths = buffer_reservation_paths()
   for n = 0, MAX_COLLISION_SUFFIX do
     local filename = named(n == 0 and "" or ("_" .. n))
-    local abs = absolute_path(dir .. "/" .. filename)
-    local state, err = reservation_state(abs)
+    local abs = canonical_file(dir, filename)
+    local state, err = reservation_state(abs, buffer_paths)
     if state == "error" then
       return nil, "Could not check artefact path: " .. tostring(err)
     end
     if state == "free" then
       reserved_paths[abs] = true
-      return filename
+      return filename, abs
     end
   end
   return nil, "Could not find a free artefact filename"
@@ -244,8 +382,10 @@ end
 
 -- Relative (or absolute, when artefacts.dir is absolute) path to insert.
 -- Creates the directory. Does not create the file.
+-- The second return is the reserved canonical path; release it if insert fails.
 -- @param raw_name string
--- @return string|nil
+-- @return string|nil link
+-- @return string|nil reserved absolute path
 local function build_artefact_link(config, raw_name)
   local normalized = normalize_name(raw_name)
   if not normalized then
@@ -256,12 +396,17 @@ local function build_artefact_link(config, raw_name)
   if not dir then
     return nil
   end
-  local filename, err = unique_artefact_filename(dir, normalized)
+  local filename, abs_or_err = unique_artefact_filename(dir, normalized)
   if not filename then
-    util.notify(err, vim.log.levels.WARN)
+    util.notify(abs_or_err, vim.log.levels.WARN)
     return nil
   end
-  return configured_dir(config) .. "/" .. filename
+  local shown = configured_dir(config)
+  if not shown then
+    release_reservation(abs_or_err)
+    return nil
+  end
+  return shown .. "/" .. filename, abs_or_err
 end
 
 -- @param loc table resolve_file_location()
@@ -325,6 +470,17 @@ local function insert_text_at_cursor(text, loc, cursor, winid)
   row = math.max(1, math.min(row, last))
   local line = vim.api.nvim_buf_get_lines(source_buf, row - 1, row, false)[1] or ""
   col = util.clamp_col_to_char_boundary(line, col)
+  -- Normal mode sits on a character. On the last one, insert after it so
+  -- that character is not pushed past the path. An empty line stays at 0.
+  if #line > 0 and col < #line then
+    local rel = vim.str_utf_start(line, #line)
+    if type(rel) == "number" then
+      local last_col = #line + math.min(rel, 0) - 1
+      if col == last_col then
+        col = #line
+      end
+    end
+  end
 
   local ok, err = pcall(vim.api.nvim_buf_set_text, source_buf, row - 1, col, row - 1, col, { text })
   if not ok then
@@ -380,11 +536,13 @@ function M.insert_artefact_link(config, name)
       util.notify("Cannot insert: original buffer is gone", vim.log.levels.WARN)
       return nil
     end
-    local link = build_artefact_link(config, raw)
+    local link, reserved = build_artefact_link(config, raw)
     if not link then
       return nil
     end
     if not insert_text_at_cursor(link, loc, cursor, winid) then
+      -- set_text failed, or the buffer is gone / no longer modifiable.
+      release_reservation(reserved)
       return nil
     end
     return link
@@ -491,11 +649,11 @@ local function is_listed_artefact(name, fullpath)
 end
 
 -- Newest first. A filename timestamp that round-trips beats mtime.
--- Equal timestamps: higher collision suffix, then name.
+-- Equal timestamps: base, then higher collision suffix. A full tie is equal.
 local function list_artefact_files_sorted(config)
   config = config or {}
   local dir = artefacts_dir_path(config)
-  if vim.fn.isdirectory(dir) ~= 1 then
+  if not dir or vim.fn.isdirectory(dir) ~= 1 then
     return {}, dir
   end
 
@@ -527,10 +685,13 @@ local function list_artefact_files_sorted(config)
     if a.ts ~= b.ts then
       return a.ts > b.ts
     end
-    if a.base == b.base and a.suffix ~= b.suffix then
+    if a.base ~= b.base then
+      return a.base > b.base
+    end
+    if a.suffix ~= b.suffix then
       return a.suffix > b.suffix
     end
-    return a.name > b.name
+    return false
   end)
 
   return entries, dir
@@ -545,10 +706,16 @@ function M.open_artefacts_in_telescope(config)
   end
 
   local entries, dir = list_artefact_files_sorted(config)
+  if not dir then
+    return
+  end
   if vim.fn.isdirectory(dir) ~= 1 then
-    if not ensure_artefacts_dir(config) then
+    dir = ensure_artefacts_dir(config)
+    if not dir then
       return
     end
+  else
+    dir = canonical_dir(dir)
   end
 
   local pickers = require("telescope.pickers")
@@ -556,18 +723,33 @@ function M.open_artefacts_in_telescope(config)
   local conf = require("telescope.config").values
   local actions = require("telescope.actions")
   local action_state = require("telescope.actions.state")
-  local make_entry = require("telescope.make_entry")
   local previewers = require("telescope.previewers")
   local sorters = require("telescope.sorters")
+  local utils = require("telescope.utils")
 
   local results = {}
   for _, e in ipairs(entries) do
     table.insert(results, e.name)
   end
 
-  local entry_maker = make_entry.gen_from_file({
-    cwd = dir,
-  })
+  -- path and filename are the absolute artefact path, never Telescope's
+  -- basename fallback (gen_from_file uses that when the file is unreadable).
+  local function entry_maker(name)
+    local path = dir .. "/" .. name
+    return {
+      value = name,
+      ordinal = name,
+      filename = path,
+      path = path,
+      display = function(entry)
+        local text, hl_group, icon = utils.transform_devicons(entry.value, entry.value, false)
+        if hl_group and icon then
+          return text, { { { 0, #icon + 1 }, hl_group } }
+        end
+        return text
+      end,
+    }
+  end
 
   local base_sorter = conf.file_sorter({})
   local chronological_sorter = sorters.Sorter:new({
@@ -589,8 +771,8 @@ function M.open_artefacts_in_telescope(config)
   local artefact_previewer = previewers.new_buffer_previewer({
     title = "Artefact preview",
     define_preview = function(self, entry, _status)
-      local path = entry.path or entry.value
-      if not path or path == "" then
+      local path = entry.path
+      if type(path) ~= "string" or path == "" then
         vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, { "No file to preview" })
         return
       end
@@ -610,16 +792,18 @@ function M.open_artefacts_in_telescope(config)
     tiebreak = function()
       return false
     end,
+    -- Empty list means "ignore nothing" (vim.F.if_nil). The default result
+    -- cap is 250; raise it so older artefacts stay selectable.
+    file_ignore_patterns = {},
+    temp__scrolling_limit = 100000,
     previewer = artefact_previewer,
     attach_mappings = function(prompt_bufnr, _map)
       actions.select_default:replace(function()
         actions.close(prompt_bufnr)
         local selection = action_state.get_selected_entry()
-        if selection then
-          local path = selection.path or selection.value
-          if path and path ~= "" then
-            vim.cmd("edit " .. vim.fn.fnameescape(path))
-          end
+        local path = selection and selection.path
+        if type(path) == "string" and path ~= "" then
+          vim.cmd.edit({ args = { path }, magic = { file = false, bar = false } })
         end
       end)
       return true
