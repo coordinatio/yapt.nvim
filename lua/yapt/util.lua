@@ -686,6 +686,17 @@ function M.chronological_sorter(base_sorter)
     chronological._was_discarded = base_sorter._was_discarded
   end
 
+  -- score is the entry point Telescope calls on this wrapper
+  -- (Picker:get_result_processor → sorter:score), so it is not part of the
+  -- forwarding above. A base may still replace the class method with its own
+  -- (Sorter:new copies opts.score); forward that one so its filtering and
+  -- scoring rules are not silently bypassed. A plain base keeps Telescope's
+  -- Sorter:score. Sorter:new copies a fixed set of fields and would drop this
+  -- one too, hence the assignment after construction.
+  if base_sorter.score ~= sorters.Sorter.score then
+    chronological.score = forward_to_base("score")
+  end
+
   return chronological
 end
 

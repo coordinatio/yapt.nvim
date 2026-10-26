@@ -394,7 +394,23 @@ local function resolve_artefacts_dir(cfg)
     )
     return nil
   end
-  local dir = cfg and cfg.artefacts and cfg.artefacts.dir
+  -- `artefacts = 5` would raise on the index below and `artefacts = "~/art"`
+  -- would silently index a string to nil and fall back to the default, so a
+  -- value that is neither nil, true, nor a table is refused here. The setup
+  -- gate keeps the bindings for it (is_enabled is true), so the warning is
+  -- what the user sees instead of an error.
+  local artefacts_cfg = cfg and cfg.artefacts
+  if artefacts_cfg ~= nil and artefacts_cfg ~= true and type(artefacts_cfg) ~= "table" then
+    util.notify("artefacts must be a table (e.g. { dir = ... })", vim.log.levels.WARN)
+    return nil
+  end
+  -- Not `x and y or nil`: a `dir = false` base would fall through to the
+  -- default here. is_enabled already refuses it, and this stays correct if
+  -- that ever moves.
+  local dir = nil
+  if type(artefacts_cfg) == "table" then
+    dir = artefacts_cfg.dir
+  end
   if dir == nil then
     dir = DEFAULT_DIR
   elseif type(dir) ~= "string" then
@@ -1105,7 +1121,16 @@ local function literal_preview_lines(path)
   if data:find("\0", 1, true) then
     return { "Binary file cannot be previewed" }
   end
-  return vim.split(data, "\n", { plain = true })
+  local lines = vim.split(data, "\n", { plain = true })
+  -- A CRLF file (an agent writing through a Windows-shaped tool, or a copied
+  -- file) would otherwise show a trailing ^M on every line. Split on "\n"
+  -- only, so LF-only lines in the same file are untouched.
+  for i, line in ipairs(lines) do
+    if line:sub(-1) == "\r" then
+      lines[i] = line:sub(1, -2)
+    end
+  end
+  return lines
 end
 
 -- Open the artefacts directory in Telescope. Warns when Telescope is absent.
