@@ -70,44 +70,31 @@ local function replace_unicode_format(name)
   return name
 end
 
--- Leading "~", "~/...", or "~user" only. "$VAR" / "${VAR}" only when set and
--- non-empty. No wildcards, "%", "#", or "<".
+-- A path segment that is exactly "." or "..". ".nvim-yapt" is a normal name.
+local function has_dot_segment(path)
+  for seg in path:gmatch("[^/]+") do
+    if seg == "." or seg == ".." then
+      return true
+    end
+  end
+  return false
+end
+
+local function strip_trailing_slash(path)
+  if path ~= "/" then
+    path = path:gsub("/+$", "")
+  end
+  return path
+end
+
+-- "$VAR" / "${VAR}" in one left-to-right pass. Each value is inserted
+-- literally. A value with a glob or a "." / ".." segment is refused.
 -- @return string|nil expanded, string|nil warning
-local function expand_configured_dir(dir)
-  if dir:find("[%*%?%[]") then
-    return nil, "Artefact directory contains a glob character: " .. dir
-  end
-
-  if dir:sub(1, 1) == "~" then
-    local home, rest
-    if dir == "~" or dir:sub(2, 2) == "/" then
-      home = vim.uv.os_homedir()
-      rest = dir:sub(2)
-    else
-      local user, tail = dir:match("^~([^/]+)(.*)$")
-      if not user or user == "" or not user:match("^[%w._-]+$") then
-        return nil, "Artefact directory ~ could not be expanded"
-      end
-      local token = "~" .. user
-      -- Only the ~user token, so expand cannot see "$", "%", "#", or globs.
-      home = vim.fn.expand(token)
-      if type(home) ~= "string" or home == "" or home == token then
-        return nil, "Artefact directory " .. token .. " could not be expanded"
-      end
-      rest = tail
-    end
-    if type(home) ~= "string" or home == "" then
-      return nil, "Artefact directory ~ could not be expanded"
-    end
-    dir = home:gsub("/+$", "") .. rest
-  end
-
-  -- One left-to-right pass. A value is inserted literally, so it cannot
-  -- introduce another variable or a wildcard for a second expansion.
+local function expand_vars(s)
   local parts = {}
   local i = 1
-  while i <= #dir do
-    local rest = dir:sub(i)
+  while i <= #s do
+    local rest = s:sub(i)
     local braced = rest:match("^%${([%w_]+)}")
     local bare = (not braced) and rest:match("^%$([%w_]+)") or nil
     local var = braced or bare
@@ -116,18 +103,101 @@ local function expand_configured_dir(dir)
       if type(val) ~= "string" or val == "" then
         return nil, "Artefact directory variable is unset or empty: $" .. var
       end
+      if val:find("[%*%?%[]") then
+        return nil, "Artefact directory variable value contains a glob character: $" .. var
+      end
+      if has_dot_segment(val) then
+        return nil, "Artefact directory variable value contains a '.' or '..' path segment: $" .. var
+      end
       parts[#parts + 1] = val
       i = i + (braced and (3 + #var) or (1 + #var))
     else
-      parts[#parts + 1] = dir:sub(i, i)
+      parts[#parts + 1] = s:sub(i, i)
       i = i + 1
     end
   end
   return table.concat(parts)
 end
 
--- @return string|nil directory to insert / join, or nil when the setting is refused
-local function configured_dir(cfg)
+-- Leading "~", "~/...", or "~user" only. The home directory is a literal
+-- prefix: "$" inside it is not expanded and does not reject the setting.
+-- "$VAR" / "${VAR}" are expanded only in the original remainder.
+-- @return string|nil expanded, string|nil warning
+local function expand_configured_dir(dir)
+  if dir:find("[%*%?%[]") then
+    return nil, "Artefact directory contains a glob character: " .. dir
+  end
+
+  if dir:sub(1, 1) ~= "~" then
+    return expand_vars(dir)
+  end
+
+  local home, rest
+  if dir == "~" or dir:sub(2, 2) == "/" then
+    home = vim.uv.os_homedir()
+    rest = dir:sub(2)
+  else
+    local user, tail = dir:match("^~([^/]+)(.*)$")
+    if not user or user == "" or not user:match("^[%w._-]+$") then
+      return nil, "Artefact directory ~ could not be expanded"
+    end
+    local token = "~" .. user
+    -- Only the ~user token, so expand cannot see "$", "%", "#", or globs.
+    home = vim.fn.expand(token)
+    if type(home) ~= "string" or home == "" or home == token then
+      return nil, "Artefact directory " .. token .. " could not be expanded"
+    end
+    rest = tail
+  end
+  if type(home) ~= "string" or home == "" then
+    return nil, "Artefact directory ~ could not be expanded"
+  end
+  local expanded_rest, err = expand_vars(rest)
+  if not expanded_rest then
+    return nil, err
+  end
+  return home:gsub("/+$", "") .. expanded_rest
+end
+
+-- Collapse "." / ".." and duplicate slashes. Does not resolve symlinks and
+-- does not expand environment variables (fnamemodify ":p" does the former).
+local function lexical_normalize(path)
+  local norm = vim.fs.normalize(path, { expand_env = false })
+  if type(norm) ~= "string" or norm == "" then
+    return "."
+  end
+  return strip_trailing_slash(norm)
+end
+
+-- Absolute form of the expanded setting, after lexical normalize.
+local function lexical_absolute(expanded)
+  local norm = lexical_normalize(expanded)
+  if vim.fn.isabsolutepath(norm) == 0 and norm ~= "/" then
+    local cwd = strip_trailing_slash(vim.fn.getcwd())
+    norm = lexical_normalize(cwd .. "/" .. norm)
+  end
+  return norm
+end
+
+-- Relative text to insert, or nil when the expanded path is absolute or
+-- contains a "." / ".." segment. Duplicate slashes are already collapsed.
+local function relative_insert_dir(expanded)
+  if vim.fn.isabsolutepath(expanded) == 1 or has_dot_segment(expanded) then
+    return nil
+  end
+  local relative = lexical_normalize(expanded)
+  if relative == "" or relative == "." or relative == "/" or has_dot_segment(relative) then
+    return nil
+  end
+  if vim.fn.isabsolutepath(relative) == 1 then
+    return nil
+  end
+  return relative
+end
+
+-- @return { lexical_abs: string, relative: string|nil }|nil
+-- Nil when the setting is refused (the caller is notified).
+local function resolve_artefacts_dir(cfg)
   local dir = cfg and cfg.artefacts and cfg.artefacts.dir
   if type(dir) ~= "string" or dir == "" then
     dir = DEFAULT_DIR
@@ -137,26 +207,38 @@ local function configured_dir(cfg)
     util.notify(err, vim.log.levels.WARN)
     return nil
   end
-  -- "/" and "///" strip to empty; fall back so we never mkdir or insert at root.
-  expanded = expanded:gsub("/+$", "")
-  if expanded == "" then
-    return DEFAULT_DIR
-  end
-  return expanded
-end
-
--- Absolute directory used for mkdir and collision checks.
--- Relative configured_dir stays relative in the inserted text; getcwd() is
--- only applied here. Nil when the configured directory is refused.
-local function artefacts_dir_path(cfg)
-  local dir = configured_dir(cfg)
-  if not dir then
+  local lexical_abs = lexical_absolute(expanded)
+  if lexical_abs == "/" then
+    util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
     return nil
   end
-  if vim.fn.isabsolutepath(dir) == 1 then
-    return dir
+  return {
+    lexical_abs = lexical_abs,
+    relative = relative_insert_dir(expanded),
+  }
+end
+
+-- Directory actually reserved: realpath of the lexical absolute path when
+-- that succeeds, otherwise the lexical path itself.
+local function reserved_directory(lexical_abs)
+  local real = vim.uv.fs_realpath(lexical_abs)
+  if type(real) == "string" and real ~= "" then
+    local norm = lexical_normalize(real)
+    if norm ~= "" and norm ~= "." then
+      return norm
+    end
   end
-  return vim.fn.getcwd() .. "/" .. dir
+  return lexical_abs
+end
+
+-- Relative form only when it is the directory that was reserved. A symlink
+-- (realpath differs), an absolute setting, or a "." / ".." segment uses the
+-- canonical absolute directory instead.
+local function shown_directory(info, reserved)
+  if info.relative and reserved == info.lexical_abs then
+    return info.relative
+  end
+  return reserved
 end
 
 -- Lexical absolute path: collapse "." / ".." and duplicate slashes.
@@ -170,26 +252,24 @@ local function normalized_absolute(path)
   return norm
 end
 
--- Directory identity after mkdir. Prefer the symlink-resolved path so
--- reservations and buffer names share one key.
-local function canonical_dir(dir)
-  local real = vim.uv.fs_realpath(dir)
-  local chosen = (type(real) == "string" and real ~= "") and real or dir
-  return normalized_absolute(chosen)
-end
-
--- @return string|nil canonical directory, or nil when mkdir fails or dir is refused
+-- @return string|nil reserved directory, string|nil path to insert
+-- Nil when mkdir fails, the setting is refused, or the reserved directory is /.
 local function ensure_artefacts_dir(config)
-  local dir = artefacts_dir_path(config)
-  if not dir then
+  local info = resolve_artefacts_dir(config)
+  if not info then
     return nil
   end
-  pcall(vim.fn.mkdir, dir, "p")
-  if vim.fn.isdirectory(dir) ~= 1 then
-    util.notify("Failed to create artefacts directory: " .. dir, vim.log.levels.ERROR)
+  pcall(vim.fn.mkdir, info.lexical_abs, "p")
+  if vim.fn.isdirectory(info.lexical_abs) ~= 1 then
+    util.notify("Failed to create artefacts directory: " .. info.lexical_abs, vim.log.levels.ERROR)
     return nil
   end
-  return canonical_dir(dir)
+  local reserved = reserved_directory(info.lexical_abs)
+  if reserved == "/" then
+    util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
+    return nil
+  end
+  return reserved, shown_directory(info, reserved)
 end
 
 -- One filename component: whitespace to "-", forbidden characters to "-".
@@ -211,7 +291,9 @@ local function normalize_name(raw)
   end
 
   name = name:gsub("%s+", "-")
-  name = name:gsub("[%z%c/\\:*?\"<>|]", "-")
+  -- "$" and "`" as well: Telescope's preview expands "$VAR", and an
+  -- unquoted shell expands both. Other punctuation is left as it was.
+  name = name:gsub("[%z%c/\\:*?\"<>|$`]", "-")
   name = name:gsub("%-+", "-")
 
   -- Extension before stripping leading dots, so ".json" is not rewritten
@@ -380,7 +462,7 @@ local function unique_artefact_filename(dir, normalized)
   return nil, "Could not find a free artefact filename"
 end
 
--- Relative (or absolute, when artefacts.dir is absolute) path to insert.
+-- Path to insert. Relative only when that directory is the one reserved.
 -- Creates the directory. Does not create the file.
 -- The second return is the reserved canonical path; release it if insert fails.
 -- @param raw_name string
@@ -392,18 +474,13 @@ local function build_artefact_link(config, raw_name)
     util.notify("Artefact name is not a valid filename", vim.log.levels.WARN)
     return nil
   end
-  local dir = ensure_artefacts_dir(config)
-  if not dir then
+  local dir, shown = ensure_artefacts_dir(config)
+  if not dir or not shown then
     return nil
   end
   local filename, abs_or_err = unique_artefact_filename(dir, normalized)
   if not filename then
     util.notify(abs_or_err, vim.log.levels.WARN)
-    return nil
-  end
-  local shown = configured_dir(config)
-  if not shown then
-    release_reservation(abs_or_err)
     return nil
   end
   return shown .. "/" .. filename, abs_or_err
@@ -480,6 +557,11 @@ local function insert_text_at_cursor(text, loc, cursor, winid)
         col = #line
       end
     end
+  end
+  -- After the last character, a relative path starting with "." would glue
+  -- to the previous word. One space when that character is not whitespace.
+  if col == #line and #line > 0 and not line:match("%s$") then
+    text = " " .. text
   end
 
   local ok, err = pcall(vim.api.nvim_buf_set_text, source_buf, row - 1, col, row - 1, col, { text })
@@ -565,11 +647,19 @@ function M.insert_artefact_link(config, name)
   return nil
 end
 
--- Timestamp prefix YYYY-MM-DD_HH-MM-SS. Impossible dates that os.time would
--- normalize (month 99, 31 Feb, …) are rejected so the caller can use mtime.
+-- Timestamp prefix YYYY-MM-DD_HH-MM-SS. The seconds field ends at the end
+-- of the name or at a character that is neither a digit nor a letter, so
+-- "0399_..." and "03weekly" are not 11:15:03. "_" and "." still separate it.
+-- Impossible dates that os.time would normalize (month 99, 31 Feb, …) are
+-- rejected so the caller can use mtime.
 -- @return number|nil unix time
 local function parse_timestamp_from_filename(filename)
-  local y, mo, d, h, mi, s = filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)")
+  local y, mo, d, h, mi, s =
+    filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)$")
+  if not y then
+    y, mo, d, h, mi, s =
+      filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)([^%d%a])")
+  end
   if not y then
     return nil
   end
@@ -652,9 +742,23 @@ end
 -- Equal timestamps: base, then higher collision suffix. A full tie is equal.
 local function list_artefact_files_sorted(config)
   config = config or {}
-  local dir = artefacts_dir_path(config)
-  if not dir or vim.fn.isdirectory(dir) ~= 1 then
+  local info = resolve_artefacts_dir(config)
+  if not info then
+    return {}, nil
+  end
+  local dir = info.lexical_abs
+  if vim.fn.isdirectory(dir) ~= 1 then
     return {}, dir
+  end
+  -- readdir on a mode 000 directory fails with E484 and looks like an empty list.
+  if vim.uv.fs_access(dir, "R") == false then
+    util.notify("Cannot read artefacts directory: " .. dir, vim.log.levels.WARN)
+    return {}, nil
+  end
+  dir = reserved_directory(dir)
+  if dir == "/" then
+    util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
+    return {}, nil
   end
 
   local entries = {}
@@ -714,8 +818,6 @@ function M.open_artefacts_in_telescope(config)
     if not dir then
       return
     end
-  else
-    dir = canonical_dir(dir)
   end
 
   local pickers = require("telescope.pickers")
