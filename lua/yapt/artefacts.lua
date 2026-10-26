@@ -122,18 +122,24 @@ end
 -- Leading "~", "~/...", or "~user" only. The home directory is a literal
 -- prefix: "$" inside it is not expanded and does not reject the setting.
 -- "$VAR" / "${VAR}" are expanded only in the original remainder.
+-- "~-" / "~+" (and "~-/...", "~+/...", "~-user", "~+user") are rejected:
+-- vim.fn.expand("~-") is $OLDPWD and expand("~+") is the cwd.
 -- @return string|nil expanded, string|nil warning
-local function expand_configured_dir(dir)
-  if dir:find("[%*%?%[]") then
-    return nil, "Artefact directory contains a glob character: " .. dir
+local function expand_leading_tilde(dir)
+  if type(dir) ~= "string" or dir:sub(1, 1) ~= "~" then
+    return dir
   end
 
-  if dir:sub(1, 1) ~= "~" then
-    return expand_vars(dir)
+  -- A username must not be "-" or "+" and must not start with either.
+  -- That is exactly a second character of "-" or "+".
+  local second = dir:sub(2, 2)
+  if second == "-" or second == "+" then
+    local token = dir:match("^~[^/]*") or dir
+    return nil, "Artefact directory " .. token .. " could not be expanded"
   end
 
   local home, rest
-  if dir == "~" or dir:sub(2, 2) == "/" then
+  if dir == "~" or second == "/" then
     home = vim.uv.os_homedir()
     rest = dir:sub(2)
   else
@@ -144,24 +150,66 @@ local function expand_configured_dir(dir)
     local token = "~" .. user
     -- Only the ~user token, so expand cannot see "$", "%", "#", or globs.
     home = vim.fn.expand(token)
-    if type(home) ~= "string" or home == "" or home == token then
+    if type(home) ~= "string" or home == "" or home == token or home:sub(1, 1) == "~" then
       return nil, "Artefact directory " .. token .. " could not be expanded"
     end
     rest = tail
   end
-  if type(home) ~= "string" or home == "" then
+  if type(home) ~= "string" or home == "" or home:sub(1, 1) == "~" then
     return nil, "Artefact directory ~ could not be expanded"
   end
   local expanded_rest, err = expand_vars(rest)
   if not expanded_rest then
     return nil, err
   end
-  return home:gsub("/+$", "") .. expanded_rest
+  local joined = home:gsub("/+$", "") .. expanded_rest
+  if joined:sub(1, 1) == "~" then
+    return nil, "Artefact directory ~ could not be expanded"
+  end
+  return joined
+end
+
+-- @return string|nil expanded, string|nil warning
+local function expand_configured_dir(dir)
+  if dir:find("[%*%?%[]") then
+    return nil, "Artefact directory contains a glob character: " .. dir
+  end
+
+  if dir:sub(1, 1) == "~" then
+    return expand_leading_tilde(dir)
+  end
+
+  local expanded, err = expand_vars(dir)
+  if not expanded then
+    return nil, err
+  end
+  -- A $VAR value may itself be "~user/...". Expand that before
+  -- vim.fs.normalize, which would paste the current home onto the rest.
+  if expanded:sub(1, 1) == "~" then
+    return expand_leading_tilde(expanded)
+  end
+  return expanded
+end
+
+-- Global cwd. getcwd() with no arguments follows a window-local :lcd.
+local function global_cwd()
+  local cwd = vim.fn.getcwd(-1, -1)
+  if type(cwd) ~= "string" or cwd == "" then
+    return ""
+  end
+  return strip_trailing_slash(cwd)
 end
 
 -- Collapse "." / ".." and duplicate slashes. Does not resolve symlinks and
--- does not expand environment variables (fnamemodify ":p" does the former).
+-- does not expand environment variables. A leading "~" is returned unchanged
+-- so vim.fs.normalize cannot paste the current home onto "~user".
 local function lexical_normalize(path)
+  if type(path) ~= "string" or path == "" then
+    return "."
+  end
+  if path:sub(1, 1) == "~" then
+    return path
+  end
   local norm = vim.fs.normalize(path, { expand_env = false })
   if type(norm) ~= "string" or norm == "" then
     return "."
@@ -170,13 +218,36 @@ local function lexical_normalize(path)
 end
 
 -- Absolute form of the expanded setting, after lexical normalize.
+-- A relative setting is joined to the global cwd.
 local function lexical_absolute(expanded)
   local norm = lexical_normalize(expanded)
   if vim.fn.isabsolutepath(norm) == 0 and norm ~= "/" then
-    local cwd = strip_trailing_slash(vim.fn.getcwd())
-    norm = lexical_normalize(cwd .. "/" .. norm)
+    local cwd = global_cwd()
+    if cwd ~= "" then
+      norm = lexical_normalize(cwd .. "/" .. norm)
+    end
   end
   return norm
+end
+
+-- True when `path` is the global cwd or the realpath of that cwd.
+local function directory_is_global_cwd(path)
+  if type(path) ~= "string" or path == "" or path == "." or path == "/" then
+    return false
+  end
+  local cwd = lexical_normalize(global_cwd())
+  if cwd == "" or cwd == "." then
+    return false
+  end
+  if path == cwd then
+    return true
+  end
+  local real = vim.uv.fs_realpath(cwd)
+  if type(real) ~= "string" or real == "" then
+    return false
+  end
+  local real_norm = lexical_normalize(real)
+  return real_norm ~= "" and real_norm ~= "." and path == real_norm
 end
 
 -- Relative text to insert, or nil when the expanded path is absolute or
@@ -212,6 +283,10 @@ local function resolve_artefacts_dir(cfg)
     util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
     return nil
   end
+  if directory_is_global_cwd(lexical_abs) then
+    util.notify("Artefact directory resolves to the working directory", vim.log.levels.WARN)
+    return nil
+  end
   return {
     lexical_abs = lexical_abs,
     relative = relative_insert_dir(expanded),
@@ -245,11 +320,10 @@ end
 -- Does not resolve symlinks and does not expand environment variables.
 local function normalized_absolute(path)
   local abs = vim.fn.fnamemodify(path, ":p")
-  local norm = vim.fs.normalize(abs, { expand_env = false })
-  if norm ~= "/" then
-    norm = norm:gsub("/+$", "")
+  if type(abs) ~= "string" or abs == "" then
+    return path
   end
-  return norm
+  return lexical_normalize(abs)
 end
 
 -- @return string|nil reserved directory, string|nil path to insert
@@ -267,6 +341,11 @@ local function ensure_artefacts_dir(config)
   local reserved = reserved_directory(info.lexical_abs)
   if reserved == "/" then
     util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
+    return nil
+  end
+  -- A symlink can lexical-normalize somewhere else and still realpath to the cwd.
+  if directory_is_global_cwd(reserved) then
+    util.notify("Artefact directory resolves to the working directory", vim.log.levels.WARN)
     return nil
   end
   return reserved, shown_directory(info, reserved)
@@ -291,8 +370,8 @@ local function normalize_name(raw)
   end
 
   name = name:gsub("%s+", "-")
-  -- "$" and "`" as well: Telescope's preview expands "$VAR", and an
-  -- unquoted shell expands both. Other punctuation is left as it was.
+  -- "$" and "`" as well: an unquoted shell expands both.
+  -- Other punctuation is left as it was.
   name = name:gsub("[%z%c/\\:*?\"<>|$`]", "-")
   name = name:gsub("%-+", "-")
 
@@ -558,11 +637,23 @@ local function insert_text_at_cursor(text, loc, cursor, winid)
       end
     end
   end
-  -- After the last character, a relative path starting with "." would glue
-  -- to the previous word. One space when that character is not whitespace.
-  if col == #line and #line > 0 and not line:match("%s$") then
-    text = " " .. text
+  -- Keep the path its own token. One space on a side whose neighboring byte
+  -- exists and is not whitespace. The start and end of the line add nothing,
+  -- and an empty line stays exactly the path.
+  local prefix, suffix = "", ""
+  if col > 0 then
+    local before = line:sub(col, col)
+    if before ~= "" and not before:match("^%s$") then
+      prefix = " "
+    end
   end
+  if col < #line then
+    local at = line:sub(col + 1, col + 1)
+    if at ~= "" and not at:match("^%s$") then
+      suffix = " "
+    end
+  end
+  text = prefix .. text .. suffix
 
   local ok, err = pcall(vim.api.nvim_buf_set_text, source_buf, row - 1, col, row - 1, col, { text })
   if not ok then
@@ -760,6 +851,10 @@ local function list_artefact_files_sorted(config)
     util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
     return {}, nil
   end
+  if directory_is_global_cwd(dir) then
+    util.notify("Artefact directory resolves to the working directory", vim.log.levels.WARN)
+    return {}, nil
+  end
 
   local entries = {}
   for _, name in ipairs(vim.fn.readdir(dir)) do
@@ -799,6 +894,42 @@ local function list_artefact_files_sorted(config)
   end)
 
   return entries, dir
+end
+
+-- Literal preview. Telescope's buffer_previewer_maker runs path_expand, which
+-- rewrites "$VAR" inside an existing filename (cost_$HOME.md).
+local PREVIEW_MAX_BYTES = 1024 * 1024
+
+local function literal_preview_lines(path)
+  if type(path) ~= "string" or path == "" then
+    return { "No file to preview" }
+  end
+  local st = vim.uv.fs_stat(path)
+  if not st then
+    return { "File not found" }
+  end
+  if st.type ~= "file" then
+    return { "Not a regular file" }
+  end
+  if type(st.size) ~= "number" or st.size > PREVIEW_MAX_BYTES then
+    return { "File is too large to preview" }
+  end
+  if st.size == 0 then
+    return { "" }
+  end
+  local fd = vim.uv.fs_open(path, "r", 438)
+  if not fd then
+    return { "File not found" }
+  end
+  local data = vim.uv.fs_read(fd, st.size, 0)
+  vim.uv.fs_close(fd)
+  if type(data) ~= "string" then
+    return { "File not found" }
+  end
+  if data:find("\0", 1, true) then
+    return { "Binary file cannot be previewed" }
+  end
+  return vim.split(data, "\n", { plain = true })
 end
 
 -- Open the artefacts directory in Telescope. Warns when Telescope is absent.
@@ -873,13 +1004,8 @@ function M.open_artefacts_in_telescope(config)
   local artefact_previewer = previewers.new_buffer_previewer({
     title = "Artefact preview",
     define_preview = function(self, entry, _status)
-      local path = entry.path
-      if type(path) ~= "string" or path == "" then
-        vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, { "No file to preview" })
-        return
-      end
-
-      previewers.buffer_previewer_maker(path, self.state.bufnr, { winid = self.state.winid })
+      local lines = literal_preview_lines(entry and entry.path)
+      pcall(vim.api.nvim_buf_set_lines, self.state.bufnr, 0, -1, false, lines)
       util.apply_wrap(self.state.winid)
     end,
   })
