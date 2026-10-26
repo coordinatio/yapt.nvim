@@ -23,13 +23,18 @@ local MAX_COLLISION_SUFFIX = 1000
 -- so a second insert in the same second must still see the first reservation.
 local reserved_paths = {}
 
--- U+00A0, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000.
+-- U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000.
 -- Lua character classes are bytes, so each codepoint is substituted on its own.
+-- The set answers "is this whole character one of them" in O(1).
 local unicode_spaces = {}
+local unicode_space_set = {}
 local function add_unicode_space(cp)
-  unicode_spaces[#unicode_spaces + 1] = vim.fn.nr2char(cp)
+  local ch = vim.fn.nr2char(cp)
+  unicode_spaces[#unicode_spaces + 1] = ch
+  unicode_space_set[ch] = true
 end
 add_unicode_space(0x00A0)
+add_unicode_space(0x1680)
 for cp = 0x2000, 0x200A do
   add_unicode_space(cp)
 end
@@ -38,6 +43,12 @@ add_unicode_space(0x2029)
 add_unicode_space(0x202F)
 add_unicode_space(0x205F)
 add_unicode_space(0x3000)
+
+-- One whole character is whitespace when Lua's %s matches it (ASCII bytes never
+-- match for a multibyte character) or it is one of the unicode spaces above.
+local function is_space_char(ch)
+  return ch ~= "" and (unicode_space_set[ch] or ch:match("^%s$") ~= nil)
+end
 
 -- Format characters that change how a path is displayed (bidi marks, zero-width
 -- joiners, BOM). Replaced with "-" so two titles cannot glue together.
@@ -774,19 +785,27 @@ local function insert_text_at_cursor(text, loc, cursor, winid)
       end
     end
   end
-  -- Keep the path its own token. One space on a side whose neighboring byte
-  -- exists and is not whitespace. The start and end of the line add nothing,
-  -- and an empty line stays exactly the path.
+  -- Keep the path its own token. One space on a side whose neighboring
+  -- character exists and is not whitespace. The start and end of the line add
+  -- nothing, and an empty line stays exactly the path.
   local prefix, suffix = "", ""
   if col > 0 then
-    local before = line:sub(col, col)
-    if before ~= "" and not before:match("^%s$") then
+    -- Byte `col` (1-based) ends the preceding character; the offset is
+    -- negative when that byte is a continuation byte.
+    local rel = vim.str_utf_start(line, col)
+    local before = type(rel) == "number" and line:sub(col + math.min(rel, 0), col)
+      or line:sub(col, col)
+    if not is_space_char(before) then
       prefix = " "
     end
   end
   if col < #line then
-    local at = line:sub(col + 1, col + 1)
-    if at ~= "" and not at:match("^%s$") then
+    -- Byte `col + 1` starts the following character; the offset counts the
+    -- remaining bytes of that character.
+    local rel = vim.str_utf_end(line, col + 1)
+    local at = type(rel) == "number" and line:sub(col + 1, col + 1 + math.max(rel, 0))
+      or line:sub(col + 1, col + 1)
+    if not is_space_char(at) then
       suffix = " "
     end
   end
