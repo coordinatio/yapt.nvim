@@ -1238,7 +1238,6 @@ function M.open_history_in_telescope(config)
   local action_state = require("telescope.actions.state")
   local make_entry = require("telescope.make_entry")
   local previewers = require("telescope.previewers")
-  local sorters = require("telescope.sorters")
 
   local results = {}
   for _, e in ipairs(entries) do
@@ -1249,22 +1248,7 @@ function M.open_history_in_telescope(config)
     cwd = dir,
   })
 
-  local base_sorter = conf.file_sorter({})
-  local chronological_sorter = sorters.Sorter:new({
-    discard = base_sorter.discard,
-    scoring_function = function(_, prompt, line, entry, cb_add, cb_filter)
-      if not prompt or prompt == "" then
-        return 1
-      end
-      return base_sorter:scoring_function(prompt, line, entry, cb_add, cb_filter)
-    end,
-    highlighter = function(_, prompt, display)
-      if base_sorter.highlighter and prompt and prompt ~= "" then
-        return base_sorter:highlighter(prompt, display)
-      end
-      return {}
-    end,
-  })
+  local chronological_sorter = util.chronological_sorter(conf.file_sorter({}))
 
   local history_previewer = previewers.new_buffer_previewer({
     title = "Prompt preview",

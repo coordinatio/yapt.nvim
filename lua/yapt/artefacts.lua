@@ -960,14 +960,12 @@ local function collision_base_and_suffix(filename)
   return filename, 0
 end
 
-local function points_at_regular_file(fullpath)
-  local st = vim.uv.fs_stat(fullpath)
-  return st ~= nil and st.type == "file"
-end
-
 -- Regular files, plus symlinks whose target is a regular file.
 -- Directories, fifos, sockets, and broken symlinks are omitted so preview
 -- cannot block on a fifo.
+-- @return boolean listed
+-- @return table|nil stat of the file that would be read (the link target for
+-- a symlink, so its mtime matches what getftime would report)
 local function is_listed_artefact(name, fullpath)
   if name == "" or name:sub(1, 1) == "." then
     return false
@@ -981,10 +979,14 @@ local function is_listed_artefact(name, fullpath)
     return false
   end
   if lst.type == "file" then
-    return true
+    return true, lst
   end
   if lst.type == "link" then
-    return points_at_regular_file(fullpath)
+    -- fs_stat follows the link; lstat describes the link itself.
+    local st = vim.uv.fs_stat(fullpath)
+    if st and st.type == "file" then
+      return true, st
+    end
   end
   return false
 end
@@ -1021,14 +1023,22 @@ local function list_artefact_files_sorted(config)
   local entries = {}
   for _, name in ipairs(vim.fn.readdir(dir)) do
     local fullpath = dir .. "/" .. name
-    if is_listed_artefact(name, fullpath) then
+    local listed, st = is_listed_artefact(name, fullpath)
+    if listed then
       local ts = parse_timestamp_from_filename(name)
       if not ts then
-        local ft = vim.fn.getftime(fullpath)
-        if type(ft) == "number" and ft >= 0 then
-          ts = ft
+        -- The stat already taken above, so listing does not stat every file
+        -- twice. getftime stays as a fallback when it is unusable.
+        local mtime = st and st.mtime and st.mtime.sec
+        if type(mtime) == "number" and mtime >= 0 then
+          ts = mtime
         else
-          ts = 0
+          local ft = vim.fn.getftime(fullpath)
+          if type(ft) == "number" and ft >= 0 then
+            ts = ft
+          else
+            ts = 0
+          end
         end
       end
       local base, suffix = collision_base_and_suffix(name)
@@ -1119,7 +1129,6 @@ function M.open_artefacts_in_telescope(config)
   local actions = require("telescope.actions")
   local action_state = require("telescope.actions.state")
   local previewers = require("telescope.previewers")
-  local sorters = require("telescope.sorters")
   local utils = require("telescope.utils")
 
   local results = {}
@@ -1146,46 +1155,7 @@ function M.open_artefacts_in_telescope(config)
     }
   end
 
-  local base_sorter = conf.file_sorter({})
-  -- Picker lifecycle runs on this wrapper. fzf-native stores its slab and
-  -- prompt cache in init and frees them in destroy; call those on the base
-  -- sorter or the first typed query indexes an uninitialized state.
-  local function forward_to_base(method)
-    if type(base_sorter[method]) ~= "function" then
-      return nil
-    end
-    return function(_, ...)
-      return base_sorter[method](base_sorter, ...)
-    end
-  end
-  -- fzf-native's start clears its own discard set because "|" and "!" are
-  -- not prefix-monotonic. Telescope records discards on this wrapper, so
-  -- copying discard would keep a miss hidden when the prompt only grows.
-  -- A sorter with no start function keeps its own discard flag.
-  -- `and false or` cannot be used here: false is discarded by `or`.
-  local discard_flag = base_sorter.discard
-  if type(base_sorter.start) == "function" then
-    discard_flag = false
-  end
-  local chronological_sorter = sorters.Sorter:new({
-    discard = discard_flag,
-    init = forward_to_base("init"),
-    start = forward_to_base("start"),
-    finish = forward_to_base("finish"),
-    destroy = forward_to_base("destroy"),
-    scoring_function = function(_, prompt, line, entry, cb_add, cb_filter)
-      if not prompt or prompt == "" then
-        return 1
-      end
-      return base_sorter:scoring_function(prompt, line, entry, cb_add, cb_filter)
-    end,
-    highlighter = function(_, prompt, display)
-      if base_sorter.highlighter and prompt and prompt ~= "" then
-        return base_sorter:highlighter(prompt, display)
-      end
-      return {}
-    end,
-  })
+  local chronological_sorter = util.chronological_sorter(conf.file_sorter({}))
 
   local artefact_previewer = previewers.new_buffer_previewer({
     title = "Artefact preview",

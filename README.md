@@ -172,7 +172,11 @@ Point an agent at a throwaway file (a report, a dump) without putting it under v
 2. Enter a name (or pass it as `:PTArtefact weekly report`). The name becomes a single filename: whitespace turns into `-`, characters that cannot live in a path component are replaced with `-`, and so are the characters an unquoted shell treats as expansion, quoting, globbing, or command separators (`$`, backtick, `;`, `&`, `(`, `)`, `'`, `!`, `[`, `]`, `{`, `}`, `<`, `>`, `*`, `?`, `|`). Letters, including non-ASCII, and case stay. Leading dots are dropped (`.notes` becomes `notes.md`). A short extension you type is kept only when it contains an ASCII letter (`data.json`); otherwise `.md` is added.
 3. The path is inserted at the cursor and kept as its own token, with a space when the neighboring character is not whitespace, for example `.nvim-yapt/artefacts/2026-10-26_11-15-03_weekly-report.md`. The same second and name get `_1`, `_2`, … before the extension when that path was already inserted in this session or the name is already taken on disk. A relative path is inserted only when it is the directory that will actually be used and the current window is still in the global working directory; otherwise the absolute path is inserted. `~/` and environment variables in `artefacts.dir` are expanded, and an absolute variable must be the whole directory and not a suffix of another path.
 
-Browse files the agent has already written with `:PTArtefacts` or `<leader>aA` (Telescope, wrap preview). The list is newest first: a parseable `YYYY-MM-DD_HH-MM-SS_` filename prefix wins, and files without one sort by modification time. Any non-hidden file in the directory is listed, not only markdown.
+The path goes at the cursor, except when the cursor is on the last character of the line: there it goes after that character, so the word is not pushed past the path.
+
+A relative path assumes the agent shares Neovim's working directory. A terminal spawned under a different `:lcd`/`:tcd` keeps its own cwd, so insert the absolute path (or `:cd` first) when the agent's cwd differs.
+
+Browse files the agent has already written with `:PTArtefacts` or `<leader>aA` (Telescope, wrap preview). The list is newest first: a parseable `YYYY-MM-DD_HH-MM-SS_` filename prefix wins, and files without one sort by modification time. Any non-hidden file in the directory is listed, not only markdown. The preview is cached per file, so reopen the picker to see content an agent wrote while it was open.
 
 ### Preset Prompts
 

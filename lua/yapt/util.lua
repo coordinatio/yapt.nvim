@@ -566,6 +566,58 @@ function M.first_non_terminal_window()
   end)
 end
 
+-- Telescope sorter that keeps finder order while the prompt is empty.
+-- Built on top of conf.file_sorter({}), which may be telescope-fzf-native.
+-- The picker runs the sorter lifecycle (init/start/finish/destroy) on this
+-- wrapper, never on the base. fzf-native stores its slab and prompt cache in
+-- init and frees them in destroy, so the lifecycle must be forwarded to the
+-- base or the first typed query indexes an uninitialized state.
+-- fzf-native's start also clears its own discard set because "|" and "!" are
+-- not prefix-monotonic. Telescope records discards on this wrapper, so copying
+-- discard would keep a miss hidden when the prompt only grows. A sorter with
+-- no start function keeps its own discard flag.
+-- `and false or` cannot be used for that: false is discarded by `or`.
+-- Telescope is required lazily so this module does not hard-depend on it.
+-- @param base_sorter table telescope sorters.Sorter
+-- @return table telescope sorters.Sorter
+function M.chronological_sorter(base_sorter)
+  local sorters = require("telescope.sorters")
+
+  local function forward_to_base(method)
+    if type(base_sorter[method]) ~= "function" then
+      return nil
+    end
+    return function(_, ...)
+      return base_sorter[method](base_sorter, ...)
+    end
+  end
+
+  local discard_flag = base_sorter.discard
+  if type(base_sorter.start) == "function" then
+    discard_flag = false
+  end
+
+  return sorters.Sorter:new({
+    discard = discard_flag,
+    init = forward_to_base("init"),
+    start = forward_to_base("start"),
+    finish = forward_to_base("finish"),
+    destroy = forward_to_base("destroy"),
+    scoring_function = function(_, prompt, line, entry, cb_add, cb_filter)
+      if not prompt or prompt == "" then
+        return 1
+      end
+      return base_sorter:scoring_function(prompt, line, entry, cb_add, cb_filter)
+    end,
+    highlighter = function(_, prompt, display)
+      if base_sorter.highlighter and prompt and prompt ~= "" then
+        return base_sorter:highlighter(prompt, display)
+      end
+      return {}
+    end,
+  })
+end
+
 -- Enable wrap/linebreak/breakindent on a window (Telescope preview).
 -- Plugin requires Neovim 0.11, so nvim_set_option_value is always present.
 function M.apply_wrap(winid)
