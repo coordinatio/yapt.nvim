@@ -12,6 +12,7 @@ YAPT gives you a quake-style popup terminal workflow: summon a terminal on deman
 - Manage multiple terminal sessions simultaneously — switch, rename, create
 - Fuzzy finder with live preview of terminal output (Telescope integration)
 - Prompt history — create markdown prompt files, browse with Telescope, send to terminal
+- Artefact paths — insert a timestamped path under `.nvim-yapt/artefacts/` into a prompt, and browse that directory in Telescope
 - Preset prompts — reusable `.md` files from Neovim config and the project, picked in Telescope
 - Passthrough mode — send keys directly to TUI apps running inside the terminal
 - Copy `@file` and `@file:start-end` links for use in AI prompts
@@ -27,7 +28,7 @@ YAPT gives you a quake-style popup terminal workflow: summon a terminal on deman
 
 - Neovim >= 0.11.0
 - Any CLI application (opencode, cursor CLI, claude, aider, etc.)
-- Telescope (optional, for fuzzy picker, prompt history, and preset prompts)
+- Telescope (optional, for fuzzy picker, prompt history, artefacts, and preset prompts)
 
 ---
 
@@ -103,6 +104,8 @@ Work with multiple terminal sessions for different tasks:
 | `<leader>aH` | Open prompt history directory in Telescope |
 | `<leader>al` | Open or switch to last prompt file from history |
 | `<leader>ap` | Open preset prompts (Telescope, or vim.ui.select) |
+| `<leader>aa` | Insert a timestamped artefact path at the cursor |
+| `<leader>aA` | Open the artefacts directory in Telescope |
 | `<leader>ac` | Copy `@file` link to clipboard (paste into CLI prompt) |
 | `<leader>i` | Send next key directly to TUI app in terminal |
 
@@ -161,6 +164,16 @@ Prompt-file buffers are automatically saved to disk when you leave them (switch 
 - **Browse history in Telescope**: `:PTHistory` or `<leader>aH`
 - **Open last prompt**: `:PTLast` or `<leader>al`
 
+### Artefacts
+
+Point an agent at a throwaway file (a report, a dump) without putting it under version control. Paths land in `${CWD}/.nvim-yapt/artefacts/`, next to prompt history. The file is not created when you insert the path — the agent writes it. The directory is created so that write has somewhere to go.
+
+1. While editing a prompt, press `<leader>aa` or run `:PTArtefact`.
+2. Enter a name (or pass it as `:PTArtefact weekly report`). The name becomes a single filename: whitespace turns into `-`, and characters that cannot live in a path component are dropped. Letters, including non-ASCII, and case stay. A short extension you type (`data.json`) is kept; otherwise `.md` is added.
+3. The path is inserted at the cursor, for example `.nvim-yapt/artefacts/2026-10-26_11-15-03_weekly-report.md`. The same second and name get `_1`, `_2`, … before the extension when that file is already on disk. An absolute `artefacts.dir` is inserted as an absolute path.
+
+Browse files the agent has already written with `:PTArtefacts` or `<leader>aA` (Telescope, newest first, wrap preview). Any non-hidden file in the directory is listed, not only markdown.
+
 ### Preset Prompts
 
 Keep reusable prompts as markdown files and clone them into history when you need them (the library file is never overwritten).
@@ -174,7 +187,7 @@ Keep reusable prompts as markdown files and clone them into history when you nee
 
 Nested folders work: `review/pr.md` shows as `review/pr.md`. Project entries are listed first and tagged `project` or `global`. Same name in both libraries appears twice.
 
-If you gitignore `.nvim-yapt/*` (recommended for draft history), allow the project library so teammates can share prompts:
+If you gitignore `.nvim-yapt/*` (recommended for draft history and temporary artefacts), allow the project library so teammates can share prompts. Artefacts under `.nvim-yapt/artefacts/` stay ignored; do not add an exception for them.
 
 ```
 .nvim-yapt/*
@@ -223,6 +236,8 @@ If both directories are empty, YAPT notifies the paths to add files to (it does 
 | `:PTHistory` | Open prompt history directory in Telescope |
 | `:PTLast` | Open or switch to last prompt file from history |
 | `:PTPresets` | Open preset prompts (Telescope, or vim.ui.select) |
+| `:PTArtefact [name]` | Insert an artefact path at the cursor (prompts when name is omitted) |
+| `:PTArtefacts` | Open the artefacts directory in Telescope |
 
 ### Utilities
 
@@ -255,12 +270,18 @@ require("yapt").setup({
     prompt_history_telescope = "<leader>aH", -- Open prompt history in Telescope
     prompt_last            = "<leader>al", -- Open or switch to last prompt buffer
     prompt_presets         = "<leader>ap", -- Open preset prompts (Telescope, or vim.ui.select)
+    artefact_insert        = "<leader>aa", -- Insert a timestamped artefact path at the cursor
+    artefact_browse        = "<leader>aA", -- Open .nvim-yapt/artefacts in Telescope
     copy_link              = "<leader>ac", -- Copy @file or @file:start-end link
   },
 
   history = {
     dir = ".nvim-yapt/history",  -- Relative to CWD
     autosave = true,           -- Save prompt-file buffers to disk when left
+  },
+
+  artefacts = {
+    dir = ".nvim-yapt/artefacts", -- Relative to CWD; absolute paths are inserted as-is
   },
 
   prompts = {
@@ -473,9 +494,10 @@ Use descriptive names to organize by task:
 For the best experience, install [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim). With Telescope you get:
 - **Terminal picker** (`<F6>`): live preview, fuzzy search by name, rename with `<C-r>`
 - **Prompt history** (`<leader>aH`): browse `.nvim-yapt/history/` with wrap preview
+- **Artefacts** (`<leader>aA`): browse `.nvim-yapt/artefacts/` with wrap preview, newest first
 - **Preset prompts** (`<leader>ap`): global + project libraries, wrap preview, `<C-s>` send, `<C-y>` insert
 
-Without Telescope, terminal and command pickers fall back to `vim.ui.select`. The history command shows a warning if Telescope is not available. Preset prompts fall back to `vim.ui.select` (Enter clones into history; extra actions require Telescope).
+Without Telescope, terminal and command pickers fall back to `vim.ui.select`. The history and artefacts commands show a warning if Telescope is not available. Preset prompts fall back to `vim.ui.select` (Enter clones into history; extra actions require Telescope).
 
 ---
 

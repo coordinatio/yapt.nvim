@@ -21,6 +21,8 @@ M.defaults = {
     prompt_history_telescope = "<leader>aH",  -- Open prompt history dir in Telescope
     prompt_last = "<leader>al",      -- Open or switch to last prompt buffer
     prompt_presets = "<leader>ap",   -- Open preset prompts (Telescope, or vim.ui.select)
+    artefact_insert = "<leader>aa",  -- Insert a timestamped artefact path at the cursor
+    artefact_browse = "<leader>aA",  -- Open .nvim-yapt/artefacts in Telescope
     copy_link = "<leader>ac",        -- Copy link (normal: @file, visual: @file:start-end) to unnamed register
   },
 
@@ -28,6 +30,11 @@ M.defaults = {
   history = {
     dir = ".nvim-yapt/history",  -- Relative to CWD
     autosave = true,           -- Save prompt-file buffers to disk when left
+  },
+
+  -- Temporary files the agent should create (not committed; under .nvim-yapt/)
+  artefacts = {
+    dir = ".nvim-yapt/artefacts", -- Relative to CWD
   },
 
   -- Preset prompt libraries (reusable .md files cloned into history)

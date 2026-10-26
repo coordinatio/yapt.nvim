@@ -4,7 +4,7 @@
 -- - Plugin setup and configuration
 -- - User-facing handlers for all operations (normal/visual/terminal mode)
 -- - Keybinding and command registration
--- - Integration between config, terminal, tabs, history, and picker modules
+-- - Integration between config, terminal, tabs, history, artefacts, and picker modules
 --
 -- Key handlers:
 -- - normal_mode_handler():       Smart toggle in split mode
@@ -21,6 +21,7 @@ local terminal = require("yapt.terminal")
 local tabs = require("yapt.tabs")
 local picker = require("yapt.picker")
 local history = require("yapt.history")
+local artefacts = require("yapt.artefacts")
 local presets = require("yapt.presets")
 local util = require("yapt.util")
 
@@ -28,7 +29,7 @@ local M = {}
 local config = {}
 
 -- Plugin version (Semantic Versioning: MAJOR.MINOR.PATCH)
-M.version = "2.0.0"
+M.version = "2.1.0"
 
 ------------------------------------------------------------
 -- Internal helpers
@@ -491,6 +492,18 @@ function M.setup(user_config)
     end, "Open preset prompts (Telescope, or vim.ui.select)")
   end
 
+  if keybindings.artefact_insert and keybindings.artefact_insert ~= "" then
+    set_n(keybindings.artefact_insert, function()
+      artefacts.insert_artefact_link(config)
+    end, "Insert artefact path at cursor")
+  end
+
+  if keybindings.artefact_browse and keybindings.artefact_browse ~= "" then
+    set_n(keybindings.artefact_browse, function()
+      artefacts.open_artefacts_in_telescope(config)
+    end, "Open artefacts directory in Telescope")
+  end
+
   if keybindings.copy_link and keybindings.copy_link ~= "" then
     set_n(keybindings.copy_link, M.copy_file_link_handler, "Copy @file link to clipboard")
     vim.keymap.set("v", keybindings.copy_link, exit_visual_then(M.copy_link_handler), {
@@ -578,6 +591,18 @@ function M.setup(user_config)
     presets.open_presets_picker(config)
   end, { desc = "Open preset prompts (Telescope, or vim.ui.select)" })
 
+  vim.api.nvim_create_user_command("PTArtefact", function(opts)
+    local name = opts.args and vim.trim(opts.args) ~= "" and opts.args or nil
+    artefacts.insert_artefact_link(config, name)
+  end, {
+    desc = "Insert an artefact path at the cursor (optional name)",
+    nargs = "*",
+  })
+
+  vim.api.nvim_create_user_command("PTArtefacts", function()
+    artefacts.open_artefacts_in_telescope(config)
+  end, { desc = "Open artefacts directory in Telescope" })
+
   vim.api.nvim_create_user_command("PTCopyLink", function(opts)
     local view_line1 = opts.line1 or vim.api.nvim_win_get_cursor(0)[1]
     local view_line2 = opts.line2 or view_line1
@@ -610,6 +635,7 @@ M.terminal = terminal
 M.tabs = tabs
 M.picker = picker
 M.history = history
+M.artefacts = artefacts
 M.presets = presets
 
 return M
