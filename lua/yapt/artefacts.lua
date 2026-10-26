@@ -964,7 +964,9 @@ local function list_artefact_files_sorted(config)
     return {}, dir
   end
   -- readdir on a mode 000 directory fails with E484 and looks like an empty list.
-  if vim.uv.fs_access(dir, "R") == false then
+  -- Mode 644 still returns names; lstat on each child then fails with EACCES
+  -- and every name is dropped. nil/error from fs_access is not a refusal.
+  if vim.uv.fs_access(dir, "R") == false or vim.uv.fs_access(dir, "X") == false then
     util.notify("Cannot read artefacts directory: " .. dir, vim.log.levels.WARN)
     return {}, nil
   end
