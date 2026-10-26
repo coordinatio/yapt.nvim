@@ -653,12 +653,17 @@ function M.chronological_sorter(base_sorter)
     discard_flag = false
   end
 
-  return sorters.Sorter:new({
+  local chronological = sorters.Sorter:new({
     discard = discard_flag,
     init = forward_to_base("init"),
     start = forward_to_base("start"),
     finish = forward_to_base("finish"),
     destroy = forward_to_base("destroy"),
+    -- A filter-based base (sorters.prefilter) still filters and still fills
+    -- its tag set. Telescope calls the wrapper's filter_function and
+    -- self.tags:insert(entry), so both must live here.
+    filter_function = forward_to_base("filter_function"),
+    tags = base_sorter.tags,
     scoring_function = function(_, prompt, line, entry, cb_add, cb_filter)
       if not prompt or prompt == "" then
         return 1
@@ -672,6 +677,16 @@ function M.chronological_sorter(base_sorter)
       return {}
     end,
   })
+
+  -- Sorter:new copies a fixed set of fields and would drop this one. A base
+  -- that filters entries itself overrides _was_discarded to false, because a
+  -- filtered entry must be scored again when the prompt grows; without the
+  -- override the wrapper's own discard state would keep that entry hidden.
+  if base_sorter._was_discarded ~= sorters.Sorter._was_discarded then
+    chronological._was_discarded = base_sorter._was_discarded
+  end
+
+  return chronological
 end
 
 -- Enable wrap/linebreak/breakindent on a window (Telescope preview).

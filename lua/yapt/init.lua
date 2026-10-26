@@ -433,9 +433,9 @@ function M.setup(user_config)
 
   local keybindings = config.keybindings
 
-  -- artefacts.dir = "" is the documented way to disable the feature. Do not
-  -- create bindings or commands that can only warn.
-  local artefacts_enabled = not (config.artefacts and config.artefacts.dir == "")
+  -- `artefacts = false` and `artefacts.dir = ""` (or `dir = false`) disable
+  -- the feature. Do not create bindings or commands that can only warn.
+  local artefacts_enabled = artefacts.is_enabled(config)
 
   -- Toggle (split)
   if keybindings.toggle and keybindings.toggle ~= "" then

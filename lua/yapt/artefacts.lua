@@ -345,21 +345,60 @@ local function relative_insert_dir(expanded)
   return relative
 end
 
+-- nvim_buf_set_text rejects these. Spaces stay; they do not break the insert.
+local function has_break_byte(path)
+  return type(path) == "string"
+    and (path:find("\0", 1, true) or path:find("\r", 1, true) or path:find("\n", 1, true))
+end
+
+-- @return boolean refused (already notified)
+local function refuse_break_byte(path)
+  if not has_break_byte(path) then
+    return false
+  end
+  util.notify(
+    "Artefact directory contains a newline, carriage return, or NUL",
+    vim.log.levels.WARN
+  )
+  return true
+end
+
+-- True unless the setting explicitly disables artefacts: `artefacts = false`,
+-- or a table whose `dir` is "" (like prompts.dir) or false. A non-string
+-- truthy dir stays enabled so the resolver can warn about it.
+-- Used by the setup gate and by the resolver, so both agree on "disabled".
+-- @param config table|nil
+-- @return boolean
+function M.is_enabled(config)
+  local cfg = config and config.artefacts
+  if cfg == nil or cfg == true then
+    return true
+  end
+  if cfg == false then
+    return false
+  end
+  if type(cfg) == "table" and (cfg.dir == "" or cfg.dir == false) then
+    return false
+  end
+  return true
+end
+
 -- @return { lexical_abs: string, relative: string|nil }|nil
 -- Nil when the setting is refused (the caller is notified).
 local function resolve_artefacts_dir(cfg)
+  if not M.is_enabled(cfg) then
+    -- Both spellings land here: artefacts = false, and dir = "" / dir = false.
+    util.notify(
+      "Artefacts are disabled (artefacts.dir is empty or false)",
+      vim.log.levels.WARN
+    )
+    return nil
+  end
   local dir = cfg and cfg.artefacts and cfg.artefacts.dir
   if dir == nil then
     dir = DEFAULT_DIR
   elseif type(dir) ~= "string" then
     util.notify("Artefact directory must be a string", vim.log.levels.WARN)
-    return nil
-  elseif dir == "" then
-    -- An empty string disables artefacts, like prompts.dir.
-    util.notify(
-      "Artefact directory is not configured (artefacts.dir is empty)",
-      vim.log.levels.WARN
-    )
     return nil
   end
   local expanded, err = expand_configured_dir(dir)
@@ -367,25 +406,11 @@ local function resolve_artefacts_dir(cfg)
     util.notify(err, vim.log.levels.WARN)
     return nil
   end
-  -- nvim_buf_set_text rejects these. Refuse before mkdir or insert.
-  -- Spaces stay; they do not break the insert.
-  local function has_break_byte(path)
-    return type(path) == "string"
-      and (path:find("\0", 1, true) or path:find("\r", 1, true) or path:find("\n", 1, true))
-  end
-  if has_break_byte(expanded) then
-    util.notify(
-      "Artefact directory contains a newline, carriage return, or NUL",
-      vim.log.levels.WARN
-    )
+  if refuse_break_byte(expanded) then
     return nil
   end
   local lexical_abs = lexical_absolute(expanded)
-  if has_break_byte(lexical_abs) then
-    util.notify(
-      "Artefact directory contains a newline, carriage return, or NUL",
-      vim.log.levels.WARN
-    )
+  if refuse_break_byte(lexical_abs) then
     return nil
   end
   if lexical_abs == "/" then
@@ -459,6 +484,11 @@ local function ensure_artefacts_dir(config)
     return nil
   end
   local reserved = reserved_directory(info.lexical_abs)
+  -- The realpath is what is inserted, and a symlink target can name bytes the
+  -- lexical path did not. Re-check after the realpath.
+  if refuse_break_byte(reserved) then
+    return nil
+  end
   if reserved == "/" then
     util.notify("Artefact directory resolves to /", vim.log.levels.WARN)
     return nil
@@ -543,32 +573,53 @@ local function normalize_name(raw)
   return stem .. ext
 end
 
--- Paths that name `abs` for reservation purposes.
--- The normalized absolute name always counts. When the buffer file does not
--- exist, also count realpath(parent) + basename so ".." and symlinks match
--- the canonical directory. fnamemodify(..., ":p") alone does neither.
-local function buffer_reservation_paths()
-  local taken = {}
+-- Basenames of every named buffer, collected with string operations only (no
+-- syscalls). Candidate filenames differ only by their "_N" suffix, so a
+-- collision is possible only with a buffer whose basename is exactly the
+-- candidate filename.
+-- @return table<string, string[]> basename -> raw buffer names
+local function buffer_names_by_basename()
+  local by_base = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(buf) then
       local name = vim.api.nvim_buf_get_name(buf)
       if name ~= "" then
-        local norm = normalized_absolute(name)
-        taken[norm] = true
-        if vim.uv.fs_lstat(norm) == nil then
-          local parent = vim.fs.dirname(norm)
-          local base = vim.fs.basename(norm)
-          if parent and parent ~= "" and base and base ~= "" then
-            local real_parent = vim.uv.fs_realpath(parent)
-            if type(real_parent) == "string" and real_parent ~= "" then
-              taken[normalized_absolute(real_parent .. "/" .. base)] = true
-            end
+        local base = vim.fs.basename(name)
+        if base and base ~= "" then
+          local names = by_base[base]
+          if not names then
+            names = {}
+            by_base[base] = names
           end
+          names[#names + 1] = name
         end
       end
     end
   end
-  return taken
+  return by_base
+end
+
+-- Add the paths that name `name` for reservation purposes.
+-- The normalized absolute name always counts. When the buffer file does not
+-- exist, also count realpath(parent) + basename so ".." and symlinks match
+-- the canonical directory. fnamemodify(..., ":p") alone does neither.
+-- Only called for a name whose basename matched a candidate, so the syscalls
+-- below are proportional to matching names, not to the session's buffers.
+local function add_buffer_reservation_paths(taken, names)
+  for _, name in ipairs(names) do
+    local norm = normalized_absolute(name)
+    taken[norm] = true
+    if vim.uv.fs_lstat(norm) == nil then
+      local parent = vim.fs.dirname(norm)
+      local base = vim.fs.basename(norm)
+      if parent and parent ~= "" and base and base ~= "" then
+        local real_parent = vim.uv.fs_realpath(parent)
+        if type(real_parent) == "string" and real_parent ~= "" then
+          taken[normalized_absolute(real_parent .. "/" .. base)] = true
+        end
+      end
+    end
+  end
 end
 
 local function canonical_file(dir, filename)
@@ -667,9 +718,18 @@ local function unique_artefact_filename(dir, normalized)
     return stamp .. "_" .. stem .. suffix .. ext
   end
 
-  local buffer_paths = buffer_reservation_paths()
+  local buffer_names = buffer_names_by_basename()
+  local buffer_paths = {}
   for n = 0, MAX_COLLISION_SUFFIX do
     local filename = named(n == 0 and "" or ("_" .. n))
+    -- Basename-driven: only a buffer that can actually collide pays for
+    -- fnamemodify / fs_lstat / fs_realpath. A buffer named "..._1.md" is
+    -- caught by the candidate named "..._1.md", because each candidate is
+    -- looked up under its own basename.
+    local matching_buffers = buffer_names[filename]
+    if matching_buffers then
+      add_buffer_reservation_paths(buffer_paths, matching_buffers)
+    end
     local abs = canonical_file(dir, filename)
     local state, err = reservation_state(abs, buffer_paths)
     if state == "error" then
@@ -1112,7 +1172,21 @@ function M.open_artefacts_in_telescope(config)
       local path = entry and entry.path
       -- Cache hit: Telescope has already shown the buffer for this path.
       if type(path) == "string" and path ~= "" and self.state.bufname == path then
-        util.apply_wrap(self.state.winid)
+        -- A cache hit skips Telescope's buffer-creating branch, which is the
+        -- only place it sets state.winid. Fall back to the window showing the
+        -- cached preview buffer so wrap still applies to the first preview
+        -- after a picker is reopened.
+        local winid = self.state.winid
+        if not winid or not vim.api.nvim_win_is_valid(winid) then
+          local bufnr = self.state.bufnr
+          if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+            local found = vim.fn.bufwinid(bufnr)
+            if type(found) == "number" and found ~= -1 then
+              winid = found
+            end
+          end
+        end
+        util.apply_wrap(winid)
         return
       end
       local lines = literal_preview_lines(path)
