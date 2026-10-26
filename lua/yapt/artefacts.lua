@@ -1189,8 +1189,9 @@ function M.open_artefacts_in_telescope(config)
     end,
     -- Empty list means "ignore nothing" (vim.F.if_nil). Size the results
     -- buffer to the listed files, at least one row when the directory is
-    -- empty. A fixed cap pre-fills blank lines, and descending layout leaves
-    -- those blanks above the real rows.
+    -- empty. Ascending completion puts the cursor on line 1, so that row
+    -- stays valid when the results window is taller than the list.
+    sorting_strategy = "ascending",
     file_ignore_patterns = {},
     temp__scrolling_limit = math.max(#results, 1),
     previewer = artefact_previewer,
@@ -1207,7 +1208,19 @@ function M.open_artefacts_in_telescope(config)
         end
       end
       actions.select_default:replace(function()
-        open_path(vim.cmd.edit)
+        actions.close(prompt_bufnr)
+        local selection = action_state.get_selected_entry()
+        local path = selection and selection.path
+        if type(path) ~= "string" or path == "" then
+          return
+        end
+        -- :edit in the restored window replaces a terminal buffer and fails
+        -- with E1513 on winfixbuf. Split above those windows instead.
+        local command = vim.cmd.edit
+        if util.is_protected_window(vim.api.nvim_get_current_win()) then
+          command = vim.cmd.split
+        end
+        command({ args = { path }, magic = { file = false, bar = false } })
       end)
       actions.select_horizontal:replace(function()
         open_path(vim.cmd.new)
