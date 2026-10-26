@@ -260,24 +260,56 @@ local function same_directory(a, b)
   return ra ~= "" and ra ~= "." and ra == rb
 end
 
--- True when `path` is the global cwd or the realpath of that cwd.
-local function directory_is_global_cwd(path)
+-- True when `path` is `root` or the realpath of `root`.
+-- `path` is already normalized. A missing realpath is not a match.
+-- "." is not a directory identity. This is the cwd check's identity.
+local function directory_is(path, root)
   if type(path) ~= "string" or path == "" or path == "." or path == "/" then
     return false
   end
-  local cwd = lexical_normalize(global_cwd())
-  if cwd == "" or cwd == "." then
+  if type(root) ~= "string" or root == "" then
     return false
   end
-  if path == cwd then
+  root = lexical_normalize(root)
+  if root == "" or root == "." then
+    return false
+  end
+  if path == root then
     return true
   end
-  local real = vim.uv.fs_realpath(cwd)
+  local real = vim.uv.fs_realpath(root)
   if type(real) ~= "string" or real == "" then
     return false
   end
   local real_norm = lexical_normalize(real)
   return real_norm ~= "" and real_norm ~= "." and path == real_norm
+end
+
+-- True when `path` is the global cwd or the realpath of that cwd.
+local function directory_is_global_cwd(path)
+  return directory_is(path, global_cwd())
+end
+
+-- True when `path` is the home directory or the realpath of that home.
+local function directory_is_home(path)
+  local home = vim.uv.os_homedir()
+  if type(home) ~= "string" or home == "" then
+    return false
+  end
+  return directory_is(path, home)
+end
+
+-- Lexical path, or an existing symlink whose realpath is that directory.
+local function path_is_home(path)
+  if directory_is_home(path) then
+    return true
+  end
+  local real = vim.uv.fs_realpath(path)
+  if type(real) ~= "string" or real == "" then
+    return false
+  end
+  local norm = lexical_normalize(real)
+  return norm ~= "" and norm ~= "." and directory_is_home(norm)
 end
 
 -- Relative text to insert, or nil when the expanded path is absolute or
@@ -335,6 +367,12 @@ local function resolve_artefacts_dir(cfg)
   end
   if directory_is_global_cwd(lexical_abs) then
     util.notify("Artefact directory resolves to the working directory", vim.log.levels.WARN)
+    return nil
+  end
+  -- Before mkdir. Bare "~" / "~/" and a symlink whose realpath is home
+  -- are the home directory; "~/something" is not.
+  if path_is_home(lexical_abs) then
+    util.notify("Artefact directory resolves to the home directory", vim.log.levels.WARN)
     return nil
   end
   return {
@@ -401,6 +439,16 @@ local function ensure_artefacts_dir(config)
   -- A symlink can lexical-normalize somewhere else and still realpath to the cwd.
   if directory_is_global_cwd(reserved) then
     util.notify("Artefact directory resolves to the working directory", vim.log.levels.WARN)
+    return nil
+  end
+  if path_is_home(reserved) then
+    util.notify("Artefact directory resolves to the home directory", vim.log.levels.WARN)
+    return nil
+  end
+  -- An existing directory is not success when the agent cannot create the file.
+  -- nil/error from fs_access is not a refusal; listing may still read it.
+  if vim.uv.fs_access(reserved, "W") == false then
+    util.notify("Artefact directory is not writable: " .. reserved, vim.log.levels.WARN)
     return nil
   end
   return reserved, shown_directory(info, reserved)
@@ -571,10 +619,12 @@ local function unique_artefact_filename(dir, normalized)
   if fixed > NAME_MAX then
     return nil, "Artefact filename is too long"
   end
+  local full_stem = stem
   stem = truncate_utf8(stem, NAME_MAX - fixed)
   if stem == "" then
     return nil, "Artefact filename is too long"
   end
+  local shortened = stem ~= full_stem
 
   local function named(suffix)
     return stamp .. "_" .. stem .. suffix .. ext
@@ -589,6 +639,12 @@ local function unique_artefact_filename(dir, normalized)
       return nil, "Could not check artefact path: " .. tostring(err)
     end
     if state == "free" then
+      if shortened then
+        util.notify(
+          "Artefact name was shortened to fit the filename limit",
+          vim.log.levels.WARN
+        )
+      end
       reserved_paths[abs] = true
       return filename, abs
     end
@@ -871,6 +927,10 @@ local function is_listed_artefact(name, fullpath)
   if name == "" or name:sub(1, 1) == "." then
     return false
   end
+  -- A newline, CR, or NUL would break a picker row. Leave the file on disk.
+  if name:find("\0", 1, true) or name:find("\r", 1, true) or name:find("\n", 1, true) then
+    return false
+  end
   local lst = vim.uv.fs_lstat(fullpath)
   if not lst then
     return false
@@ -1051,8 +1111,17 @@ function M.open_artefacts_in_telescope(config)
       return base_sorter[method](base_sorter, ...)
     end
   end
+  -- fzf-native's start clears its own discard set because "|" and "!" are
+  -- not prefix-monotonic. Telescope records discards on this wrapper, so
+  -- copying discard would keep a miss hidden when the prompt only grows.
+  -- A sorter with no start function keeps its own discard flag.
+  -- `and false or` cannot be used here: false is discarded by `or`.
+  local discard_flag = base_sorter.discard
+  if type(base_sorter.start) == "function" then
+    discard_flag = false
+  end
   local chronological_sorter = sorters.Sorter:new({
-    discard = base_sorter.discard,
+    discard = discard_flag,
     init = forward_to_base("init"),
     start = forward_to_base("start"),
     finish = forward_to_base("finish"),
