@@ -1187,13 +1187,13 @@ function M.open_artefacts_in_telescope(config)
     tiebreak = function()
       return false
     end,
-    -- Empty list means "ignore nothing" (vim.F.if_nil). Size the results
-    -- buffer to the listed files, at least one row when the directory is
-    -- empty. Ascending completion puts the cursor on line 1, so that row
-    -- stays valid when the results window is taller than the list.
-    sorting_strategy = "ascending",
+    -- Empty list means "ignore nothing" (vim.F.if_nil). 250 is Telescope's
+    -- default results floor. Descending completion indexes
+    -- max_results - window_height, which stays a valid 1-based row for a
+    -- normal window. A directory with more than 250 files still lists all
+    -- of them.
     file_ignore_patterns = {},
-    temp__scrolling_limit = math.max(#results, 1),
+    temp__scrolling_limit = math.max(#results, 250),
     previewer = artefact_previewer,
     attach_mappings = function(prompt_bufnr, _map)
       -- Literal Ex args. Telescope's select_* normalizes against the process
