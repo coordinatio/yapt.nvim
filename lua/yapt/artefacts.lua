@@ -894,62 +894,6 @@ function M.insert_artefact_link(config, name)
   return nil
 end
 
--- Timestamp prefix YYYY-MM-DD_HH-MM-SS. The seconds field ends at the end
--- of the name or at a character that is neither a digit nor a letter, so
--- "0399_..." and "03weekly" are not 11:15:03. "_" and "." still separate it.
--- Impossible dates that os.time would normalize (month 99, 31 Feb, …) are
--- rejected so the caller can use mtime.
--- @return number|nil unix time
-local function parse_timestamp_from_filename(filename)
-  local y, mo, d, h, mi, s =
-    filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)$")
-  if not y then
-    y, mo, d, h, mi, s =
-      filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)([^%d%a])")
-  end
-  if not y then
-    return nil
-  end
-  local year = tonumber(y)
-  local month = tonumber(mo)
-  local day = tonumber(d)
-  local hour = tonumber(h)
-  local min = tonumber(mi)
-  local sec = tonumber(s)
-  if not year or not month or not day or not hour or not min or not sec then
-    return nil
-  end
-  if month < 1 or month > 12 or day < 1 or day > 31 then
-    return nil
-  end
-  if hour > 23 or min > 59 or sec > 59 then
-    return nil
-  end
-  local ok, ts = pcall(os.time, {
-    year = year,
-    month = month,
-    day = day,
-    hour = hour,
-    min = min,
-    sec = sec,
-  })
-  if not ok or type(ts) ~= "number" then
-    return nil
-  end
-  local round = os.date("*t", ts)
-  if type(round) ~= "table"
-    or round.year ~= year
-    or round.month ~= month
-    or round.day ~= day
-    or round.hour ~= hour
-    or round.min ~= min
-    or round.sec ~= sec
-  then
-    return nil
-  end
-  return ts
-end
-
 -- Collision suffix "_N" immediately before the last extension, else 0.
 -- Base is the filename with that "_N" removed, so "_10" and "_2" share a base.
 local function collision_base_and_suffix(filename)
@@ -1025,7 +969,7 @@ local function list_artefact_files_sorted(config)
     local fullpath = dir .. "/" .. name
     local listed, st = is_listed_artefact(name, fullpath)
     if listed then
-      local ts = parse_timestamp_from_filename(name)
+      local ts = util.parse_timestamp_from_filename(name)
       if not ts then
         -- The stat already taken above, so listing does not stat every file
         -- twice. getftime stays as a fallback when it is unusable.

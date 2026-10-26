@@ -21,26 +21,6 @@ local function history_dir_path(cfg)
   return cwd .. "/" .. dir:gsub("/$", "")
 end
 
--- Parse timestamp from filename like: 2025-02-04_14-30-45.md
--- Also accepts a collision suffix (2025-02-04_14-30-45_1.md) so that
--- auto-created files from same-second sends are still recognized as
--- prompt-file buffers (and thus closed after send).
--- @return number|nil unix timestamp (seconds) if parseable
-local function parse_timestamp_from_filename(filename)
-  local y, mo, d, h, mi, s = filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)(_?%d*)%.md$")
-  if not y then
-    return nil
-  end
-  return os.time({
-    year = tonumber(y),
-    month = tonumber(mo),
-    day = tonumber(d),
-    hour = tonumber(h),
-    min = tonumber(mi),
-    sec = tonumber(s),
-  })
-end
-
 -- Return sorted history entries (new -> old).
 -- Sorting strategy:
 -- 1) Prefer timestamp parsed from filename (YYYY-MM-DD_HH-MM-SS.md)
@@ -60,7 +40,7 @@ local function list_history_files_sorted(config)
   for _, f in ipairs(files) do
     if f:match("%.md$") then
       local fullpath = dir .. "/" .. f
-      local ts = parse_timestamp_from_filename(f)
+      local ts = util.parse_timestamp_from_filename(f)
 
       if not ts then
         local ft = vim.fn.getftime(fullpath)
@@ -112,7 +92,10 @@ local function is_plugin_prompt_file_buffer(buf, config)
   end
 
   local filename = vim.fn.fnamemodify(abs_path, ":t")
-  return parse_timestamp_from_filename(filename) ~= nil
+  -- Only .md files are listed as prompts, so only they are plugin prompt
+  -- buffers. The shared parser accepts any extension, hence the extra test.
+  return filename:match("%.md$") ~= nil
+    and util.parse_timestamp_from_filename(filename) ~= nil
 end
 
 -- Persist a prompt-file buffer to disk when the user leaves it, so it shows
@@ -331,7 +314,7 @@ end
 
 -- Build a unique timestamped history file path (.md), guarding against
 -- same-second collisions by appending _1, _2, ... before the extension.
--- Collision-suffixed names still parse via parse_timestamp_from_filename.
+-- Collision-suffixed names still parse via util.parse_timestamp_from_filename.
 -- `extra_taken` is always treated as occupied (e.g. a colliding path
 -- unique_history_path would otherwise re-pick).
 local function unique_history_path(dir, extra_taken)

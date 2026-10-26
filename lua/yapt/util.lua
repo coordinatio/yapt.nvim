@@ -566,6 +566,62 @@ function M.first_non_terminal_window()
   end)
 end
 
+-- Timestamp prefix YYYY-MM-DD_HH-MM-SS. The seconds field ends at the end
+-- of the name or at a character that is neither a digit nor a letter, so
+-- "0399_..." and "03weekly" are not 11:15:03. "_" and "." still separate it.
+-- Impossible dates that os.time would normalize (month 99, 31 Feb, …) are
+-- rejected so the caller can use mtime.
+-- @return number|nil unix time
+function M.parse_timestamp_from_filename(filename)
+  local y, mo, d, h, mi, s =
+    filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)$")
+  if not y then
+    y, mo, d, h, mi, s =
+      filename:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)_(%d%d)%-(%d%d)%-(%d%d)([^%d%a])")
+  end
+  if not y then
+    return nil
+  end
+  local year = tonumber(y)
+  local month = tonumber(mo)
+  local day = tonumber(d)
+  local hour = tonumber(h)
+  local min = tonumber(mi)
+  local sec = tonumber(s)
+  if not year or not month or not day or not hour or not min or not sec then
+    return nil
+  end
+  if month < 1 or month > 12 or day < 1 or day > 31 then
+    return nil
+  end
+  if hour > 23 or min > 59 or sec > 59 then
+    return nil
+  end
+  local ok, ts = pcall(os.time, {
+    year = year,
+    month = month,
+    day = day,
+    hour = hour,
+    min = min,
+    sec = sec,
+  })
+  if not ok or type(ts) ~= "number" then
+    return nil
+  end
+  local round = os.date("*t", ts)
+  if type(round) ~= "table"
+    or round.year ~= year
+    or round.month ~= month
+    or round.day ~= day
+    or round.hour ~= hour
+    or round.min ~= min
+    or round.sec ~= sec
+  then
+    return nil
+  end
+  return ts
+end
+
 -- Telescope sorter that keeps finder order while the prompt is empty.
 -- Built on top of conf.file_sorter({}), which may be telescope-fzf-native.
 -- The picker runs the sorter lifecycle (init/start/finish/destroy) on this

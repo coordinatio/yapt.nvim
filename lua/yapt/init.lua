@@ -433,6 +433,10 @@ function M.setup(user_config)
 
   local keybindings = config.keybindings
 
+  -- artefacts.dir = "" is the documented way to disable the feature. Do not
+  -- create bindings or commands that can only warn.
+  local artefacts_enabled = not (config.artefacts and config.artefacts.dir == "")
+
   -- Toggle (split)
   if keybindings.toggle and keybindings.toggle ~= "" then
     set_n(keybindings.toggle, M.normal_mode_handler, "Toggle YAPT terminal")
@@ -492,13 +496,13 @@ function M.setup(user_config)
     end, "Open preset prompts (Telescope, or vim.ui.select)")
   end
 
-  if keybindings.artefact_insert and keybindings.artefact_insert ~= "" then
+  if artefacts_enabled and keybindings.artefact_insert and keybindings.artefact_insert ~= "" then
     set_n(keybindings.artefact_insert, function()
       artefacts.insert_artefact_link(config)
     end, "Insert artefact path at cursor")
   end
 
-  if keybindings.artefact_browse and keybindings.artefact_browse ~= "" then
+  if artefacts_enabled and keybindings.artefact_browse and keybindings.artefact_browse ~= "" then
     set_n(keybindings.artefact_browse, function()
       artefacts.open_artefacts_in_telescope(config)
     end, "Open artefacts directory in Telescope")
@@ -591,17 +595,19 @@ function M.setup(user_config)
     presets.open_presets_picker(config)
   end, { desc = "Open preset prompts (Telescope, or vim.ui.select)" })
 
-  vim.api.nvim_create_user_command("PTArtefact", function(opts)
-    local name = opts.args and vim.trim(opts.args) ~= "" and opts.args or nil
-    artefacts.insert_artefact_link(config, name)
-  end, {
-    desc = "Insert an artefact path at the cursor (optional name)",
-    nargs = "*",
-  })
+  if artefacts_enabled then
+    vim.api.nvim_create_user_command("PTArtefact", function(opts)
+      local name = opts.args and vim.trim(opts.args) ~= "" and opts.args or nil
+      artefacts.insert_artefact_link(config, name)
+    end, {
+      desc = "Insert an artefact path at the cursor (optional name)",
+      nargs = "*",
+    })
 
-  vim.api.nvim_create_user_command("PTArtefacts", function()
-    artefacts.open_artefacts_in_telescope(config)
-  end, { desc = "Open artefacts directory in Telescope" })
+    vim.api.nvim_create_user_command("PTArtefacts", function()
+      artefacts.open_artefacts_in_telescope(config)
+    end, { desc = "Open artefacts directory in Telescope" })
+  end
 
   vim.api.nvim_create_user_command("PTCopyLink", function(opts)
     local view_line1 = opts.line1 or vim.api.nvim_win_get_cursor(0)[1]

@@ -174,6 +174,8 @@ Point an agent at a throwaway file (a report, a dump) without putting it under v
 
 The path goes at the cursor, except when the cursor is on the last character of the line: there it goes after that character, so the word is not pushed past the path.
 
+`$`/`${...}` in `artefacts.dir` is always expanded — there is no escape for a literal `$` in that setting (filenames are unaffected: a `$` in a name is replaced with `-`).
+
 A relative path assumes the agent shares Neovim's working directory. A terminal spawned under a different `:lcd`/`:tcd` keeps its own cwd, so insert the absolute path (or `:cd` first) when the agent's cwd differs.
 
 Browse files the agent has already written with `:PTArtefacts` or `<leader>aA` (Telescope, wrap preview). The list is newest first: a parseable `YYYY-MM-DD_HH-MM-SS_` filename prefix wins, and files without one sort by modification time. Any non-hidden file in the directory is listed, not only markdown. The preview is cached per file, so reopen the picker to see content an agent wrote while it was open.
@@ -285,7 +287,7 @@ require("yapt").setup({
   },
 
   artefacts = {
-    dir = ".nvim-yapt/artefacts", -- Default when unset; an empty string disables artefacts. Relative to CWD; a relative path is inserted only when it is the directory that will actually be used and the current window is still in the global working directory; otherwise the absolute path is inserted
+    dir = ".nvim-yapt/artefacts", -- Default when unset; an empty string disables artefacts and does not create its keybindings or commands. Relative to CWD; a relative path is inserted only when it is the directory that will actually be used and the current window is still in the global working directory; otherwise the absolute path is inserted
   },
 
   prompts = {
