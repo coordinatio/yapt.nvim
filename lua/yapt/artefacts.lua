@@ -1149,8 +1149,19 @@ function M.open_artefacts_in_telescope(config)
 
   local artefact_previewer = previewers.new_buffer_previewer({
     title = "Artefact preview",
+    -- Literal absolute path. Telescope reuses the buffer only when this name
+    -- is already cached; do not pass it through path_expand or expand().
+    get_buffer_by_name = function(_, entry)
+      return entry and entry.path
+    end,
     define_preview = function(self, entry, _status)
-      local lines = literal_preview_lines(entry and entry.path)
+      local path = entry and entry.path
+      -- Cache hit: Telescope has already shown the buffer for this path.
+      if type(path) == "string" and path ~= "" and self.state.bufname == path then
+        util.apply_wrap(self.state.winid)
+        return
+      end
+      local lines = literal_preview_lines(path)
       local bufnr = self.state.bufnr
       pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, lines)
       -- Basename only. vim.filetype.match must not see the full path, so a
@@ -1176,10 +1187,12 @@ function M.open_artefacts_in_telescope(config)
     tiebreak = function()
       return false
     end,
-    -- Empty list means "ignore nothing" (vim.F.if_nil). The default result
-    -- cap is 250; raise it so older artefacts stay selectable.
+    -- Empty list means "ignore nothing" (vim.F.if_nil). Size the results
+    -- buffer to the listed files, at least one row when the directory is
+    -- empty. A fixed cap pre-fills blank lines, and descending layout leaves
+    -- those blanks above the real rows.
     file_ignore_patterns = {},
-    temp__scrolling_limit = 100000,
+    temp__scrolling_limit = math.max(#results, 1),
     previewer = artefact_previewer,
     attach_mappings = function(prompt_bufnr, _map)
       -- Literal Ex args. Telescope's select_* normalizes against the process
